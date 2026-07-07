@@ -13,7 +13,9 @@
 		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
 	</group>
 	
-	<node pkg="image_transport" type="republish" name="republish" args="compressed in:=/left_camera/image raw out:=/left_camera/image" output="screen" respawn="true"/>
+	<!-- 离线 bag 回放: 转换脚本已输出 raw BGR8, 不需要解压 -->
+	<!-- 在线实时运行: 取消下面注释 -->
+	<!-- <node pkg="image_transport" type="republish" name="republish" args="compressed in:=/left_camera/image raw out:=/left_camera/image" output="screen" respawn="true"/> -->
 
 launch-prefix="gdb -ex run --args"
 launch-prefix="valgrind --leak-check=full"

@@ -7,23 +7,35 @@ common:
   ros_driver_bug_fix: false
 
 extrin_calib:
-  extrinsic_T: [0.04165, 0.02326, -0.0284]
+  # extrinsic_T: [0.04165, 0.02326, -0.0284]
+  # extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+  # Rcl: [0.00610193,-0.999863,-0.0154172,
+  #       -0.00615449,0.0153796,-0.999863,
+  #       0.999962,0.00619598,-0.0060598]
+  # Pcl: [0.0194384, 0.104689,-0.0251952]
+
+  # LiDAR → IMU: 来自 lidar_front_to_imu_front (纯平移, 无旋转)
+  extrinsic_T: [-0.011, -0.02329, 0.04412]
   extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
-  Rcl: [0.00610193,-0.999863,-0.0154172,
-        -0.00615449,0.0153796,-0.999863,
-        0.999962,0.00619598,-0.0060598] 
-  Pcl: [0.0194384, 0.104689,-0.0251952]
+  # Camera ← LiDAR: 从 camera_front_to_lidar_front 求逆得到
+  Rcl: [-0.00017680004575335042,-0.9999850942958,-0.005454021750385471,
+         0.24715569679395047,0.005241120060100726,-0.968961610016522,
+         0.968975756368796,-0.0015193013562476718,0.24715109467522922]
+  Pcl: [-0.007051528112941402,-0.1547747748641233,-0.012845815781130435]
 
 time_offset: 
   imu_time_offset: 0.0
-  img_time_offset: 0.1
+  # 转换脚本现已保留 LiDAR/IMU/Camera 原始 header.stamp；相机时间与雷达
+  # 扫描结束实测相差约 1 ms，不再用 0.1 s 补偿旧脚本的雷达时间戳偏移。
+  img_time_offset: 0.0
   exposure_time_init: 0.0
 
 preprocess:
   point_filter_num: 1
   filter_size_surf: 0.1
   lidar_type: 1 # Livox Avia LiDAR
-  scan_line: 6
+  # 当前 /front_lidar 数据中的 line 字段实际为 0~3，共 4 条扫描线。
+  scan_line: 4
   blind: 0.8
 
 vio:
@@ -66,11 +78,14 @@ uav:
   gravity_align_en: false
 
 publish:
-  dense_map_en: true
+  # dense_map_en: true
+  dense_map_en: false       # ← 关键改动！发布降采样点云而非原始点云
   pub_effect_point_en: false 
   pub_plane_en: false
-  pub_scan_num: 1
-  blind_rgb_points: 0.0
+  # pub_scan_num: 1
+  pub_scan_num: 2           # ← 从1改为2，每2帧发布一次（地图依然完整）
+  # blind_rgb_points: 0.0
+  blind_rgb_points: 0.5     # ← 过滤近距离无效着色点
 
 evo:
   seq_name: "CBD_Building_01"
