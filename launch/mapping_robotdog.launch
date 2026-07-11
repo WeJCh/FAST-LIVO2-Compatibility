@@ -1,0 +1,22 @@
+<launch>
+<!-- Launch file for RobotDog original PointCloud2 + CompressedImage data -->
+
+	<arg name="rviz" default="true" />
+
+	<!-- 机器狗原生输入配置：/front_lidar、/front_lidar/imu、/front_camera/image_compressed -->
+	<rosparam command="load" file="$(find fast_livo)/config/robotdog.yaml" />
+
+	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+		<!-- 当前使用机器狗 front_camera 的针孔相机内参 -->
+		<rosparam file="$(find fast_livo)/config/camera_pinhole.yaml" />
+	</node>
+	
+	<group if="$(arg rviz)">
+		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
+	</group>
+
+	<!-- CompressedImage 已由 fastlivo_mapping 内部解码，不需要 image_transport republish。 -->
+
+launch-prefix="gdb -ex run --args"
+launch-prefix="valgrind --leak-check=full"
+</launch> 	

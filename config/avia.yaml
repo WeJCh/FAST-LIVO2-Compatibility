@@ -92,7 +92,8 @@ evo:
   pose_output_en: false
 
 pcd_save:
-  pcd_save_en: false
+  # 导出建图结果给远程查看时需要开启；正常退出后会保存 Log/pcd 下的 PCD 地图和轨迹。
+  pcd_save_en: true
   type: 0 # 0: World Frame, 1: Body Frame;
   colmap_output_en: false # need to set interval = -1
   filter_size_pcd: 0.15

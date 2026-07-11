@@ -43,7 +43,8 @@ enum LID_TYPE
   L515 = 4,
   XT32 = 5,
   PANDAR128 = 6,
-  ROBOSENSE = 7
+  ROBOSENSE = 7,
+  ROBOTDOG = 8  // 机器狗 PointCloud2 原生输入类型
 };
 enum SLAM_MODE
 {

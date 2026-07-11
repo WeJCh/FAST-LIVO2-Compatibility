@@ -85,6 +85,10 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointClo
     robosense_handler(msg);
     break;
 
+  case ROBOTDOG:
+    robotdog_handler(msg);
+    break;
+
   default:
     printf("Error LiDAR Type: %d \n", lidar_type);
     break;
@@ -738,6 +742,50 @@ void Preprocess::robosense_handler(const sensor_msgs::PointCloud2::ConstPtr &msg
     added_pt.curvature = (pt.timestamp - time_head) * 1000.0;
     pl_surf.points.push_back(added_pt);
   }
+  std::sort(pl_surf.points.begin(), pl_surf.points.end(), [](const PointType &a, const PointType &b) {
+    return a.curvature < b.curvature;
+  });
+}
+
+void Preprocess::robotdog_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  pcl::PointCloud<robotdog_ros::Point> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  const int plsize = pl_orig.size();
+  if (plsize == 0) return;
+  pl_surf.reserve(plsize);
+
+  for (int i = 0; i < plsize; ++i)
+  {
+    if (i % point_filter_num != 0) continue;
+
+    const auto &pt = pl_orig.points[i];
+    const double x = pt.x, y = pt.y, z = pt.z;
+    const double dist_sqr = x * x + y * y + z * z;
+    const bool is_valid = (dist_sqr >= blind_sqr) && std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(pt.timestamp);
+    if (!is_valid) continue;
+    if (pt.timestamp < 0.0) continue;
+    if (pt.line >= N_SCANS) continue;
+
+    PointType added_pt;
+    added_pt.normal_x = 0;
+    added_pt.normal_y = 0;
+    added_pt.normal_z = 0;
+    added_pt.x = pt.x;
+    added_pt.y = pt.y;
+    added_pt.z = pt.z;
+    added_pt.intensity = pt.intensity;
+    // 机器狗 timestamp 已核验为相对本帧起点的纳秒偏移；FAST-LIVO2 内部 curvature 使用毫秒。
+    // 这里直接转换单位，不套用 Avia 分支的相邻点时间修正规则，避免误压缩扫描时长。
+    added_pt.curvature = pt.timestamp / 1e6;
+    pl_surf.points.push_back(added_pt);
+  }
+
+  // 后续同步逻辑用 points.back().curvature 估计扫描结束时间，排序后可确保它是本帧最大点内时间。
   std::sort(pl_surf.points.begin(), pl_surf.points.end(), [](const PointType &a, const PointType &b) {
     return a.curvature < b.curvature;
   });

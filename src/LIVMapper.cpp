@@ -55,6 +55,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("common/img_en", img_en, 1);
   nh.param<int>("common/lidar_en", lidar_en, 1);
   nh.param<string>("common/img_topic", img_topic, "/left_camera/image");
+  nh.param<bool>("common/img_compressed", img_compressed, false); // 是否直接订阅压缩图像，机器狗数据使用 true
 
   nh.param<bool>("vio/normal_en", normal_en, true);
   nh.param<bool>("vio/inverse_composition_en", inverse_composition_en, false);
@@ -195,7 +196,10 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
             nh.subscribe(lid_topic, 200000, &LIVMapper::livox_pcl_cbk, this): 
             nh.subscribe(lid_topic, 200000, &LIVMapper::standard_pcl_cbk, this);
   sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this);
-  sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
+  // 机器狗原始数据为 CompressedImage；通过参数选择订阅类型，避免影响原有 raw Image 数据集。
+  sub_img = img_compressed ?
+            nh.subscribe(img_topic, 200000, &LIVMapper::compressed_img_cbk, this):
+            nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
   
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
@@ -826,6 +830,14 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
   return img;
 }
 
+cv::Mat LIVMapper::getImageFromCompressedMsg(const sensor_msgs::CompressedImageConstPtr &img_msg)
+{
+  // 压缩图像只在进入视觉前端前解码为 BGR，消息时间戳仍由回调中的 header.stamp 提供。
+  if (img_msg->data.empty()) return cv::Mat();
+  cv::Mat encoded(1, static_cast<int>(img_msg->data.size()), CV_8UC1, const_cast<uint8_t *>(img_msg->data.data()));
+  return cv::imdecode(encoded, cv::IMREAD_COLOR);
+}
+
 void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
 {
   if (!img_en) return;
@@ -877,6 +889,51 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   // cv::imshow("img", img);
   // cv::waitKey(1);
   // cout<<"last_timestamp_img:::"<<last_timestamp_img<<endl;
+  mtx_buffer.unlock();
+  sig_buffer.notify_all();
+}
+
+void LIVMapper::compressed_img_cbk(const sensor_msgs::CompressedImageConstPtr &msg_in)
+{
+  if (!img_en) return;
+
+  // Hiliti2022 40Hz
+  if (hilti_en)
+  {
+    static int frame_counter = 0;
+    if (++frame_counter % 4 != 0) return;
+  }
+
+  double msg_header_time = msg_in->header.stamp.toSec() + img_time_offset;
+  if (abs(msg_header_time - last_timestamp_img) < 0.001) return;
+  ROS_INFO("Get compressed image, its header time: %.6f", msg_header_time);
+  if (last_timestamp_lidar < 0) return;
+
+  if (msg_header_time < last_timestamp_img)
+  {
+    ROS_ERROR("compressed image loop back. \n");
+    return;
+  }
+
+  double img_time_correct = msg_header_time;
+  if (img_time_correct - last_timestamp_img < 0.02)
+  {
+    ROS_WARN("Compressed image need Jumps: %.6f", img_time_correct);
+    sig_buffer.notify_all();
+    return;
+  }
+
+  cv::Mat img_cur = getImageFromCompressedMsg(msg_in);
+  if (img_cur.empty())
+  {
+    ROS_WARN("Compressed image decode failed, skip this frame.");
+    return;
+  }
+
+  mtx_buffer.lock();
+  img_buffer.push_back(img_cur);
+  img_time_buffer.push_back(img_time_correct);
+  last_timestamp_img = img_time_correct;
   mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
