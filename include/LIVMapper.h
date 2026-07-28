@@ -14,6 +14,7 @@ which is included as part of this source code package.
 #define LIV_MAPPER_H
 
 #include "IMU_Processing.h"
+#include "dense_rgb_reprojector.h"
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
@@ -21,6 +22,18 @@ which is included as part of this source code package.
 #include <nav_msgs/Path.h>
 #include <sensor_msgs/CompressedImage.h>
 #include <vikit/camera_loader.h>
+
+#include <atomic>
+#include <cstdint>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
+
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+#include "loop_backend.h"
+#endif
 
 class LIVMapper
 {
@@ -58,7 +71,23 @@ public:
   void publish_odometry(const ros::Publisher &pubOdomAftMapped);
   void publish_mavros(const ros::Publisher &mavros_pose_publisher);
   void publish_path(const ros::Publisher pubPath);
+  void initializeKeyframeOutput();
+  void saveLoopClosureKeyframe();
+  void initializeDenseRgbCache();
+  void startDenseRgbCacheWriter();
+  void stopDenseRgbCacheWriter();
+  void enqueueDenseRgbCache(const PointCloudXYZRGB::Ptr &cloud, double timestamp);
+  void denseRgbCacheWriterThread();
+  void exportDenseRgbMapOnShutdown();
+  void cleanupC2IntermediateFiles();
   void readParameters(ros::NodeHandle &nh);
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  void initializeOnlineLoopBackend();
+  void startOnlineLoopBackend();
+  void stopOnlineLoopBackend();
+  void onlineLoopBackendWorker();
+  void publishOnlineLoopResult(const LoopBackendResult &result);
+#endif
   template <typename T> void set_posestamp(T &out);
   template <typename T> void pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi, Eigen::Matrix<T, 3, 1> &po);
   template <typename T> Eigen::Matrix<T, 3, 1> pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi);
@@ -88,8 +117,62 @@ public:
   double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 
   bool lidar_map_inited = false, pcd_save_en = false, img_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;
+  bool keyframe_save_en = false, keyframe_overwrite = false, keyframe_output_ready = false, has_last_keyframe = false;
   int img_save_interval = 1, pcd_save_interval = -1, pcd_save_type = 0;
   int pub_scan_num = 1;
+  int keyframe_id = 0;
+  double keyframe_translation_thresh = 1.5, keyframe_rotation_thresh_deg = 10.0;
+  double keyframe_min_interval = 0.5, keyframe_skip_initialization = 5.0, last_keyframe_time = 0.0;
+  V3D last_keyframe_pos = V3D::Zero();
+  M3D last_keyframe_rot = M3D::Identity();
+  string keyframe_dir, keyframe_output_dir;
+
+  // 阶段 C1：记录与 all_raw_points.pcd 相同的彩色世界系点云批次。
+  // 每个批次带时间戳，离线工具据此插值最终回环校正场，不改动在线前端状态。
+  struct DenseRgbCacheItem
+  {
+    uint64_t id = 0;
+    double timestamp = 0.0;
+    PointCloudXYZRGB::Ptr cloud;
+  };
+  bool dense_rgb_cache_enabled = true;
+  int dense_rgb_cache_queue_size = 8;
+  string dense_rgb_cache_dir = "Log/dense_rgb_cache";
+  // 阶段 C2：B.5 成功后自动输出完全不降采样的最终照片级地图。
+  bool dense_rgb_auto_export_on_shutdown = false;
+  double dense_rgb_auto_export_voxel_leaf_m = 0.0;
+  bool dense_rgb_cleanup_intermediate_on_success = false;
+  bool dense_rgb_auto_export_succeeded = false;
+  string dense_rgb_output_path;
+  string dense_rgb_final_output_path;
+  std::mutex dense_rgb_cache_mutex;
+  std::condition_variable dense_rgb_cache_cv;
+  deque<DenseRgbCacheItem> dense_rgb_cache_queue;
+  std::atomic<bool> dense_rgb_cache_stop{true};
+  std::thread dense_rgb_cache_writer_thread;
+  uint64_t dense_rgb_cache_next_id = 0;
+
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  // 阶段 B：前端只提交关键帧快照，后台优化结果只用于 map 坐标系发布。
+  // 不得以此覆盖 _state 或 voxelmap_manager，保证 odom 前端连续。
+  bool online_loop_enable = false;
+  double online_loop_frequency_hz = 0.2;
+  int online_loop_min_new_keyframes = 5;
+  bool online_loop_export_on_shutdown = true;
+  bool online_loop_output_overwrite = false;
+  bool online_loop_finalized = false;
+  bool online_loop_final_export_succeeded = false;
+  string online_loop_output_dir = "Log/loop_online_final";
+  string online_loop_final_output_dir;
+  std::unique_ptr<LoopBackend> online_loop_backend;
+  std::thread online_loop_thread;
+  std::atomic<bool> online_loop_stop{false};
+  std::atomic<bool> online_loop_running{false};
+  ros::Publisher pubLoopOptimizedPath;
+  ros::Publisher pubLoopKeyframeMap;
+  ros::Publisher pubLoopOptimizedOdom;
+  ros::Publisher pubLoopConstraintEdges;
+#endif
 
   StatesGroup imu_propagate, latest_ekf_state;
 
@@ -143,7 +226,7 @@ public:
   PointCloudXYZRGB::Ptr pcl_wait_save;
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
 
-  ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
+  ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points, fout_keyframe_pose;
 
   pcl::VoxelGrid<PointType> downSizeFilterSurf;
 

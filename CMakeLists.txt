@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 2.8.3)
 project(fast_livo)
 
-set(CMAKE_BUILD_TYPE "Release")
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "Release")
+endif()
 message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -99,6 +101,15 @@ find_package(OpenCV REQUIRED)
 find_package(Sophus REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
 
+option(BUILD_LOOP_OPTIMIZER "Build the GTSAM loop backend and standalone offline optimizer" ON)
+if(BUILD_LOOP_OPTIMIZER)
+  find_package(GTSAMCMakeTools QUIET)
+  find_package(GTSAM QUIET)
+  if(NOT GTSAM_FOUND)
+    message(WARNING "GTSAM was not found: fast_livo_loop_optimize will not be built. Install/source GTSAM, then configure again with -DBUILD_LOOP_OPTIMIZER=ON.")
+  endif()
+endif()
+
 set(Sophus_LIBRARIES libSophus.so)
 
 # Define the catkin package
@@ -127,6 +138,16 @@ add_library(laser_mapping src/LIVMapper.cpp)
 # Add the main executable
 add_executable(fastlivo_mapping src/main.cpp)
 
+# 阶段 C1：不依赖 GTSAM 的离线 RGB 稠密地图重投影工具。
+# 它读取阶段 B/B.5 导出的优化关键帧位姿，因此即使本机未安装 GTSAM 也能编译和使用。
+add_library(dense_rgb_reprojector src/dense_rgb_reprojector.cpp)
+target_link_libraries(laser_mapping dense_rgb_reprojector)
+add_executable(fast_livo_rgb_reproject src/rgb_reprojector_main.cpp)
+target_link_libraries(fast_livo_rgb_reproject
+  dense_rgb_reprojector
+  ${PCL_LIBRARIES}
+)
+
 # Link libraries to the executable
 target_link_libraries(fastlivo_mapping
   laser_mapping
@@ -144,4 +165,30 @@ target_link_libraries(fastlivo_mapping
 # Link mimalloc if found
 if(mimalloc_FOUND)
   target_link_libraries(fastlivo_mapping mimalloc)
+endif()
+
+if(BUILD_LOOP_OPTIMIZER AND GTSAM_FOUND)
+  add_library(loop_backend
+    src/loop_backend.cpp
+  )
+  target_link_libraries(loop_backend
+    ${PCL_LIBRARIES}
+    gtsam
+  )
+
+  # 阶段 B：LIVMapper 仅依赖 LoopBackend 的快照接口，不直接依赖 GTSAM 状态。
+  target_link_libraries(laser_mapping
+    loop_backend
+  )
+  target_compile_definitions(laser_mapping PRIVATE FAST_LIVO_HAS_LOOP_BACKEND)
+  target_compile_definitions(fastlivo_mapping PRIVATE FAST_LIVO_HAS_LOOP_BACKEND)
+
+  add_executable(fast_livo_loop_optimize
+    src/loop_optimizer_main.cpp
+  )
+  target_link_libraries(fast_livo_loop_optimize
+    loop_backend
+    ${PCL_LIBRARIES}
+    gtsam
+  )
 endif()

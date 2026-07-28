@@ -12,6 +12,115 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 
+#include <cerrno>
+#include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace
+{
+bool createDirectoryRecursively(const std::string &path)
+{
+  if (path.empty()) return false;
+
+  std::string current;
+  size_t start = 0;
+  if (path.front() == '/')
+  {
+    current = "/";
+    start = 1;
+  }
+
+  while (start <= path.size())
+  {
+    const size_t end = path.find('/', start);
+    const std::string component = path.substr(start, end - start);
+    if (!component.empty())
+    {
+      if (!current.empty() && current.back() != '/') current += '/';
+      current += component;
+      if (::mkdir(current.c_str(), 0755) != 0 && errno != EEXIST)
+      {
+        ROS_ERROR("Failed to create keyframe directory '%s': %s", current.c_str(), strerror(errno));
+        return false;
+      }
+    }
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  return true;
+}
+
+bool isManagedLogPath(const std::string &path)
+{
+  const std::string log_root = std::string(ROOT_DIR) + "Log/";
+  return path.size() > log_root.size() && path.compare(0, log_root.size(), log_root) == 0;
+}
+
+bool removePathRecursively(const std::string &path)
+{
+  if (!isManagedLogPath(path))
+  {
+    ROS_ERROR("Refusing to remove a path outside the generated Log directory: %s", path.c_str());
+    return false;
+  }
+
+  struct stat status;
+  if (::lstat(path.c_str(), &status) != 0)
+  {
+    return errno == ENOENT;
+  }
+  if (!S_ISDIR(status.st_mode)) return ::unlink(path.c_str()) == 0;
+
+  DIR *directory = ::opendir(path.c_str());
+  if (!directory)
+  {
+    ROS_ERROR("Cannot open generated directory for cleanup: %s", path.c_str());
+    return false;
+  }
+  bool success = true;
+  while (dirent *entry = ::readdir(directory))
+  {
+    const std::string name(entry->d_name);
+    if (name == "." || name == "..") continue;
+    if (!removePathRecursively(path + "/" + name)) success = false;
+  }
+  ::closedir(directory);
+  if (::rmdir(path.c_str()) != 0)
+  {
+    ROS_ERROR("Cannot remove generated directory: %s", path.c_str());
+    success = false;
+  }
+  return success;
+}
+
+bool copyGeneratedFile(const std::string &source, const std::string &target)
+{
+  if (!isManagedLogPath(source) || !isManagedLogPath(target))
+  {
+    ROS_ERROR("Refusing to copy a result outside the generated Log directory.");
+    return false;
+  }
+  std::ifstream input(source, std::ios::binary);
+  std::ofstream output(target, std::ios::binary | std::ios::trunc);
+  if (!input.is_open() || !output.is_open())
+  {
+    ROS_ERROR("Cannot copy final trajectory from %s to %s", source.c_str(), target.c_str());
+    return false;
+  }
+  output << input.rdbuf();
+  return !input.bad() && output.good();
+}
+
+bool isPathInsideDirectory(const std::string &path, const std::string &directory)
+{
+  if (path.size() <= directory.size()) return false;
+  if (path.compare(0, directory.size(), directory) != 0) return false;
+  return directory.back() == '/' || path[directory.size()] == '/';
+}
+} // namespace
+
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
       extR(M3D::Identity())
@@ -41,11 +150,21 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   root_dir = ROOT_DIR;
   initializeFiles();
   initializeComponents();
+  initializeKeyframeOutput();
+  initializeDenseRgbCache();
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  initializeOnlineLoopBackend();
+#endif
   path.header.stamp = ros::Time::now();
   path.header.frame_id = "camera_init";
 }
 
-LIVMapper::~LIVMapper() {}
+LIVMapper::~LIVMapper()
+{
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  stopOnlineLoopBackend();
+#endif
+}
 
 void LIVMapper::readParameters(ros::NodeHandle &nh)
 {
@@ -102,6 +221,30 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
 
   nh.param<bool>("pcd_save/colmap_output_en", colmap_output_en, false);
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
+
+  nh.param<bool>("loop_closure/keyframe_save_en", keyframe_save_en, false);
+  nh.param<string>("loop_closure/keyframe_dir", keyframe_dir, "Log/pcd/keyframes");
+  nh.param<bool>("loop_closure/keyframe_overwrite", keyframe_overwrite, false);
+  nh.param<double>("loop_closure/keyframe_translation_m", keyframe_translation_thresh, 1.5);
+  nh.param<double>("loop_closure/keyframe_rotation_deg", keyframe_rotation_thresh_deg, 10.0);
+  nh.param<double>("loop_closure/keyframe_min_interval_s", keyframe_min_interval, 0.5);
+  nh.param<double>("loop_closure/skip_initialization_s", keyframe_skip_initialization, 5.0);
+  nh.param<bool>("dense_global_map/enabled", dense_rgb_cache_enabled, true);
+  nh.param<int>("dense_global_map/cache_queue_size", dense_rgb_cache_queue_size, 8);
+  nh.param<string>("dense_global_map/cache_dir", dense_rgb_cache_dir, "Log/dense_rgb_cache");
+  nh.param<bool>("dense_global_map/auto_export_on_shutdown", dense_rgb_auto_export_on_shutdown, false);
+  nh.param<double>("dense_global_map/auto_export_voxel_leaf_m", dense_rgb_auto_export_voxel_leaf_m, 0.0);
+  nh.param<string>("dense_global_map/output_path", dense_rgb_output_path, "");
+  nh.param<bool>("dense_global_map/cleanup_intermediate_on_success",
+                 dense_rgb_cleanup_intermediate_on_success, false);
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  nh.param<bool>("loop_backend/online_enable", online_loop_enable, false);
+  nh.param<double>("loop_backend/online_frequency_hz", online_loop_frequency_hz, 0.2);
+  nh.param<int>("loop_backend/online_min_new_keyframes", online_loop_min_new_keyframes, 5);
+  nh.param<bool>("loop_backend/export_on_shutdown", online_loop_export_on_shutdown, true);
+  nh.param<string>("loop_backend/output_dir", online_loop_output_dir, "Log/loop_online_final");
+  nh.param<bool>("loop_backend/output_overwrite", online_loop_output_overwrite, false);
+#endif
   nh.param<vector<double>>("extrin_calib/extrinsic_T", extrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/extrinsic_R", extrinR, vector<double>());
   nh.param<vector<double>>("extrin_calib/Pcl", cameraextrinT, vector<double>());
@@ -190,6 +333,603 @@ void LIVMapper::initializeFiles()
   fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), std::ios::out);
 }
 
+void LIVMapper::initializeKeyframeOutput()
+{
+  if (!keyframe_save_en) return;
+
+  keyframe_output_dir = keyframe_dir;
+  if (keyframe_output_dir.empty())
+  {
+    ROS_ERROR("loop_closure/keyframe_dir is empty; keyframe recording is disabled.");
+    keyframe_save_en = false;
+    return;
+  }
+  if (keyframe_output_dir.front() != '/') keyframe_output_dir = std::string(ROOT_DIR) + keyframe_output_dir;
+
+  const std::string pose_path = keyframe_output_dir + "/keyframe_poses_imu.txt";
+  if (!keyframe_overwrite && std::ifstream(pose_path).good())
+  {
+    ROS_ERROR("Keyframe pose file already exists: %s. Choose a new loop_closure/keyframe_dir or set keyframe_overwrite=true.", pose_path.c_str());
+    keyframe_save_en = false;
+    return;
+  }
+  if (!createDirectoryRecursively(keyframe_output_dir))
+  {
+    keyframe_save_en = false;
+    return;
+  }
+
+  fout_keyframe_pose.open(pose_path, std::ios::out);
+  if (!fout_keyframe_pose.is_open())
+  {
+    ROS_ERROR("Failed to open keyframe pose file: %s", pose_path.c_str());
+    keyframe_save_en = false;
+    return;
+  }
+
+  std::ofstream metadata(keyframe_output_dir + "/metadata.yaml", std::ios::out);
+  metadata << "cloud_frame: lidar\n"
+           << "pose_frame: camera_init_to_imu\n"
+           << "point_cloud: '<id>.pcd, undistorted and downsampled in the LiDAR frame'\n"
+           << "pose_file: keyframe_poses_imu.txt\n"
+           << "pose_format: 'id timestamp tx ty tz qx qy qz qw'\n"
+           << "composition: 'T_camera_init_lidar = T_camera_init_imu * T_imu_lidar'\n"
+           << "T_imu_lidar_translation: [" << extT[0] << ", " << extT[1] << ", " << extT[2] << "]\n"
+           << "T_imu_lidar_rotation_row_major: [" << extR(0, 0) << ", " << extR(0, 1) << ", " << extR(0, 2) << ", "
+           << extR(1, 0) << ", " << extR(1, 1) << ", " << extR(1, 2) << ", "
+           << extR(2, 0) << ", " << extR(2, 1) << ", " << extR(2, 2) << "]\n";
+
+  keyframe_output_ready = true;
+  ROS_INFO("Loop-closure keyframes will be saved to: %s", keyframe_output_dir.c_str());
+}
+
+void LIVMapper::initializeDenseRgbCache()
+{
+  if (!dense_rgb_cache_enabled) return;
+  if (!img_en)
+  {
+    ROS_WARN("[dense-rgb] dense_global_map/enabled is true but common/img_en is false; cache recording is disabled.");
+    dense_rgb_cache_enabled = false;
+    return;
+  }
+  if (dense_rgb_cache_dir.empty()) dense_rgb_cache_dir = "Log/dense_rgb_cache";
+  if (dense_rgb_cache_dir.front() != '/') dense_rgb_cache_dir = std::string(ROOT_DIR) + dense_rgb_cache_dir;
+  if (!dense_rgb_output_path.empty() && dense_rgb_output_path.front() != '/')
+  {
+    dense_rgb_output_path = std::string(ROOT_DIR) + dense_rgb_output_path;
+  }
+  if (dense_rgb_cache_queue_size < 1) dense_rgb_cache_queue_size = 1;
+  if (dense_rgb_auto_export_voxel_leaf_m < 0.0)
+  {
+    ROS_WARN("[dense-rgb] auto_export_voxel_leaf_m is negative; using 0 (no downsampling).");
+    dense_rgb_auto_export_voxel_leaf_m = 0.0;
+  }
+}
+
+void LIVMapper::startDenseRgbCacheWriter()
+{
+  if (!dense_rgb_cache_enabled || dense_rgb_cache_writer_thread.joinable()) return;
+
+  const std::string frames_dir = dense_rgb_cache_dir + "/frames";
+  if (!createDirectoryRecursively(frames_dir))
+  {
+    ROS_ERROR("[dense-rgb] Cannot create cache directory: %s", frames_dir.c_str());
+    dense_rgb_cache_enabled = false;
+    return;
+  }
+
+  // manifest.csv is the complete input contract of the offline C1 exporter.
+  // Old frame files are harmless: only entries from this newly created manifest are read.
+  std::ofstream manifest(dense_rgb_cache_dir + "/manifest.csv", std::ios::out | std::ios::trunc);
+  if (!manifest.is_open())
+  {
+    ROS_ERROR("[dense-rgb] Cannot create cache manifest in: %s", dense_rgb_cache_dir.c_str());
+    dense_rgb_cache_enabled = false;
+    return;
+  }
+  manifest << "frame_id,timestamp,point_count,pcd_path\n";
+  manifest.close();
+
+  {
+    std::lock_guard<std::mutex> lock(dense_rgb_cache_mutex);
+    dense_rgb_cache_queue.clear();
+    dense_rgb_cache_next_id = 0;
+    dense_rgb_cache_stop.store(false);
+  }
+  dense_rgb_cache_writer_thread = std::thread(&LIVMapper::denseRgbCacheWriterThread, this);
+  ROS_INFO("[dense-rgb] Recording frame-addressable RGB batches in: %s", dense_rgb_cache_dir.c_str());
+}
+
+void LIVMapper::stopDenseRgbCacheWriter()
+{
+  if (!dense_rgb_cache_writer_thread.joinable()) return;
+  {
+    std::lock_guard<std::mutex> lock(dense_rgb_cache_mutex);
+    dense_rgb_cache_stop.store(true);
+  }
+  dense_rgb_cache_cv.notify_all();
+  dense_rgb_cache_writer_thread.join();
+}
+
+void LIVMapper::enqueueDenseRgbCache(const PointCloudXYZRGB::Ptr &cloud, double timestamp)
+{
+  if (!dense_rgb_cache_enabled || !cloud || cloud->empty() || !dense_rgb_cache_writer_thread.joinable()) return;
+
+  // The color cloud is a fresh batch created in publish_frame_world and is not modified later.
+  // A bounded queue moves PCD I/O off the LIO/VIO thread while never dropping mapping data.
+  std::unique_lock<std::mutex> lock(dense_rgb_cache_mutex);
+  dense_rgb_cache_cv.wait(lock, [this]() {
+    return dense_rgb_cache_stop.load() ||
+           static_cast<int>(dense_rgb_cache_queue.size()) < dense_rgb_cache_queue_size;
+  });
+  if (dense_rgb_cache_stop.load()) return;
+
+  DenseRgbCacheItem item;
+  item.id = dense_rgb_cache_next_id++;
+  item.timestamp = timestamp;
+  item.cloud = cloud;
+  dense_rgb_cache_queue.push_back(item);
+  lock.unlock();
+  dense_rgb_cache_cv.notify_all();
+}
+
+void LIVMapper::denseRgbCacheWriterThread()
+{
+  const std::string frames_dir = dense_rgb_cache_dir + "/frames";
+  std::ofstream manifest(dense_rgb_cache_dir + "/manifest.csv", std::ios::out | std::ios::app);
+  if (!manifest.is_open())
+  {
+    ROS_ERROR("[dense-rgb] Cannot append cache manifest: %s", dense_rgb_cache_dir.c_str());
+    std::lock_guard<std::mutex> lock(dense_rgb_cache_mutex);
+    dense_rgb_cache_stop.store(true);
+    dense_rgb_cache_cv.notify_all();
+    return;
+  }
+
+  pcl::PCDWriter writer;
+  while (true)
+  {
+    DenseRgbCacheItem item;
+    {
+      std::unique_lock<std::mutex> lock(dense_rgb_cache_mutex);
+      dense_rgb_cache_cv.wait(lock, [this]() {
+        return dense_rgb_cache_stop.load() || !dense_rgb_cache_queue.empty();
+      });
+      if (dense_rgb_cache_queue.empty())
+      {
+        if (dense_rgb_cache_stop.load()) break;
+        continue;
+      }
+      item = dense_rgb_cache_queue.front();
+      dense_rgb_cache_queue.pop_front();
+    }
+    dense_rgb_cache_cv.notify_all();
+
+    std::ostringstream filename;
+    filename << frames_dir << "/frame_" << std::setfill('0') << std::setw(6) << item.id << ".pcd";
+    if (writer.writeBinary(filename.str(), *item.cloud) != 0)
+    {
+      ROS_ERROR("[dense-rgb] Failed to write RGB cache batch: %s", filename.str().c_str());
+      continue;
+    }
+    manifest << item.id << ',' << std::setprecision(17) << item.timestamp << ','
+             << item.cloud->size() << ',' << filename.str() << '\n';
+    manifest.flush();
+  }
+}
+
+void LIVMapper::exportDenseRgbMapOnShutdown()
+{
+  dense_rgb_auto_export_succeeded = false;
+  dense_rgb_final_output_path.clear();
+  if (!dense_rgb_cache_enabled || !dense_rgb_auto_export_on_shutdown) return;
+
+#ifndef FAST_LIVO_HAS_LOOP_BACKEND
+  ROS_ERROR("[dense-rgb] Automatic export requires the GTSAM loop backend, which was not built.");
+  return;
+#else
+  if (!online_loop_final_export_succeeded)
+  {
+    ROS_ERROR("[dense-rgb] Skip automatic RGB export because final loop optimization output is unavailable.");
+    return;
+  }
+  if (keyframe_output_dir.empty())
+  {
+    ROS_ERROR("[dense-rgb] Skip automatic RGB export because loop keyframe recording was not initialized.");
+    return;
+  }
+
+  DenseRgbReprojectConfig config;
+  config.cache_dir = dense_rgb_cache_dir;
+  config.raw_keyframe_pose_path = keyframe_output_dir + "/keyframe_poses_imu.txt";
+  config.optimized_keyframe_pose_path = online_loop_final_output_dir + "/optimized_keyframe_poses_imu.txt";
+  config.output_path = dense_rgb_output_path.empty()
+      ? std::string(ROOT_DIR) + "Log/pcd/all_global_optimized_rgb_dense_full.pcd"
+      : dense_rgb_output_path;
+  config.voxel_leaf_m = dense_rgb_auto_export_voxel_leaf_m;
+
+  ROS_INFO("[dense-rgb] Automatic final export begins: %s (voxel leaf %.3f m).",
+           config.output_path.c_str(), config.voxel_leaf_m);
+  std::string error;
+  if (!reprojectDenseRgbMap(config, &error))
+  {
+    ROS_ERROR("[dense-rgb] Automatic final export failed; cache and keyframes are preserved: %s", error.c_str());
+    return;
+  }
+  dense_rgb_auto_export_succeeded = true;
+  dense_rgb_final_output_path = config.output_path;
+  ROS_INFO("[dense-rgb] Automatic final RGB map export completed: %s", config.output_path.c_str());
+#endif
+}
+
+void LIVMapper::cleanupC2IntermediateFiles()
+{
+  if (!dense_rgb_cleanup_intermediate_on_success || !dense_rgb_auto_export_succeeded) return;
+
+  // 仅在最终稠密 PCD 已成功写入后清理，失败时保留所有输入便于离线恢复。
+  if (fout_keyframe_pose.is_open()) fout_keyframe_pose.close();
+  if (fout_lidar_pos.is_open()) fout_lidar_pos.close();
+
+  const std::string pcd_dir = std::string(ROOT_DIR) + "Log/pcd";
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  const std::string optimized_pose_source = online_loop_final_output_dir + "/optimized_keyframe_poses_imu.txt";
+  const std::string optimized_pose_target = pcd_dir + "/optimized_keyframe_poses_imu.txt";
+  if (!online_loop_final_output_dir.empty() && !copyGeneratedFile(optimized_pose_source, optimized_pose_target))
+  {
+    ROS_ERROR("[dense-rgb] C2 cleanup skipped: final optimized trajectory could not be copied.");
+    return;
+  }
+#endif
+
+  bool success = true;
+  success = removePathRecursively(dense_rgb_cache_dir) && success;
+  if (!keyframe_output_dir.empty()) success = removePathRecursively(keyframe_output_dir) && success;
+
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  if (!online_loop_final_output_dir.empty())
+  {
+    // 默认最终稠密 PCD 已输出到 Log/pcd，因此该目录可整体清理。
+    // 若用户把 output_path 指回该目录，则保护最终 PCD，仅删除其余中间结果。
+    if (!isPathInsideDirectory(dense_rgb_final_output_path, online_loop_final_output_dir))
+    {
+      success = removePathRecursively(online_loop_final_output_dir) && success;
+    }
+    else
+    {
+      success = removePathRecursively(online_loop_final_output_dir + "/all_global_optimized.pcd") && success;
+      success = removePathRecursively(online_loop_final_output_dir + "/loop_edges.csv") && success;
+      success = removePathRecursively(online_loop_final_output_dir + "/report.yaml") && success;
+      success = removePathRecursively(online_loop_final_output_dir + "/optimized_keyframe_poses_imu.txt") && success;
+    }
+  }
+#endif
+
+  // 保留 all_downsampled_points.pcd，与原 FAST-LIVO2 的结果组织保持一致。
+  success = removePathRecursively(pcd_dir + "/lidar_poses.txt") && success;
+
+  if (success)
+  {
+    ROS_INFO("[dense-rgb] C2 cleanup complete. Kept raw map, downsampled map, final dense RGB map, and optimized trajectory.");
+  }
+  else
+  {
+    ROS_WARN("[dense-rgb] C2 export succeeded, but some intermediate files could not be removed.");
+  }
+}
+
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+void LIVMapper::initializeOnlineLoopBackend()
+{
+  if (!online_loop_enable) return;
+
+  // 在线参数与离线工具使用同一组语义，便于先用阶段 A 验证，再平滑迁移到阶段 B。
+  ros::NodeHandle nh;
+  LoopBackendConfig config;
+  nh.param<double>("loop_backend/candidate_radius_m", config.candidate_radius_m, config.candidate_radius_m);
+  nh.param<double>("loop_backend/min_time_separation_s", config.min_time_separation_s,
+                   config.min_time_separation_s);
+  nh.param<int>("loop_backend/min_keyframe_index_gap", config.min_keyframe_index_gap,
+                config.min_keyframe_index_gap);
+  nh.param<int>("loop_backend/history_keyframes_each_side", config.history_keyframes_each_side,
+                config.history_keyframes_each_side);
+  nh.param<double>("loop_backend/icp_voxel_leaf_m", config.icp_voxel_leaf_m, config.icp_voxel_leaf_m);
+  nh.param<double>("loop_backend/icp_max_correspondence_m", config.icp_max_correspondence_m,
+                   config.icp_max_correspondence_m);
+  nh.param<int>("loop_backend/icp_max_iterations", config.icp_max_iterations, config.icp_max_iterations);
+  nh.param<double>("loop_backend/icp_fitness_threshold", config.icp_fitness_threshold,
+                   config.icp_fitness_threshold);
+  nh.param<int>("loop_backend/min_current_points", config.min_current_points, config.min_current_points);
+  nh.param<int>("loop_backend/min_history_points", config.min_history_points, config.min_history_points);
+  nh.param<double>("loop_backend/odom_rotation_sigma_rad", config.odom_rotation_sigma_rad,
+                   config.odom_rotation_sigma_rad);
+  nh.param<double>("loop_backend/odom_translation_sigma_m", config.odom_translation_sigma_m,
+                   config.odom_translation_sigma_m);
+  nh.param<double>("loop_backend/loop_rotation_sigma_rad", config.loop_rotation_sigma_rad,
+                   config.loop_rotation_sigma_rad);
+  nh.param<double>("loop_backend/loop_translation_sigma_min_m", config.loop_translation_sigma_min_m,
+                   config.loop_translation_sigma_min_m);
+  nh.param<double>("loop_backend/loop_translation_sigma_max_m", config.loop_translation_sigma_max_m,
+                   config.loop_translation_sigma_max_m);
+  nh.param<double>("loop_backend/global_map_leaf_m", config.global_map_leaf_m, config.global_map_leaf_m);
+
+  if (online_loop_frequency_hz <= 0.0) online_loop_frequency_hz = 0.2;
+  if (online_loop_min_new_keyframes < 1) online_loop_min_new_keyframes = 1;
+
+  Eigen::Isometry3d T_imu_lidar = Eigen::Isometry3d::Identity();
+  T_imu_lidar.linear() = extR;
+  T_imu_lidar.translation() = extT;
+  online_loop_backend.reset(new LoopBackend(config));
+  online_loop_backend->setImuLidarExtrinsic(T_imu_lidar);
+  ROS_INFO("Online loop backend enabled: %.2f Hz, at least %d new keyframes per optimization.",
+           online_loop_frequency_hz, online_loop_min_new_keyframes);
+}
+
+void LIVMapper::startOnlineLoopBackend()
+{
+  if (!online_loop_enable || !online_loop_backend || online_loop_running.load()) return;
+
+  online_loop_stop.store(false);
+  online_loop_finalized = false;
+  online_loop_final_export_succeeded = false;
+  online_loop_final_output_dir.clear();
+  online_loop_running.store(true);
+  online_loop_thread = std::thread(&LIVMapper::onlineLoopBackendWorker, this);
+  ROS_INFO("Online loop-backend worker started.");
+}
+
+void LIVMapper::stopOnlineLoopBackend()
+{
+  if (!online_loop_backend || online_loop_finalized) return;
+
+  online_loop_stop.store(true);
+  if (online_loop_thread.joinable()) online_loop_thread.join();
+  online_loop_running.store(false);
+
+  // Ctrl-C 后仍可能有不足 online_min_new_keyframes 的尾部数据。
+  // 工作线程已停止，此处独占后端并将其纳入最终图优化，避免最终地图缺尾段。
+  if (online_loop_backend->pendingOnlineKeyframeCount() > 0)
+  {
+    std::string final_optimize_error;
+    if (!online_loop_backend->runOnce(&final_optimize_error))
+    {
+      ROS_ERROR("Final online loop optimization failed: %s", final_optimize_error.c_str());
+    }
+  }
+
+  if (online_loop_export_on_shutdown)
+  {
+    std::string output_dir = online_loop_output_dir;
+    if (output_dir.empty())
+    {
+      ROS_ERROR("loop_backend/output_dir is empty; skip final optimized-map export.");
+    }
+    else
+    {
+      if (output_dir.front() != '/') output_dir = std::string(ROOT_DIR) + output_dir;
+      const std::string report_path = output_dir + "/report.yaml";
+      if (!online_loop_output_overwrite && std::ifstream(report_path).good())
+      {
+        ROS_ERROR("Final loop output already exists: %s. Choose a new loop_backend/output_dir or set output_overwrite=true.",
+                  report_path.c_str());
+      }
+      else
+      {
+        std::string export_error;
+        if (online_loop_backend->exportLatestOnlineResult(output_dir, &export_error))
+        {
+          online_loop_final_export_succeeded = true;
+          online_loop_final_output_dir = output_dir;
+          ROS_INFO("Final online loop result exported to: %s", output_dir.c_str());
+        }
+        else
+        {
+          ROS_ERROR("Final optimized-map export failed: %s", export_error.c_str());
+        }
+      }
+    }
+  }
+  online_loop_finalized = true;
+}
+
+void LIVMapper::onlineLoopBackendWorker()
+{
+  ros::Rate rate(online_loop_frequency_hz);
+  while (ros::ok() && !online_loop_stop.load())
+  {
+    if (online_loop_backend &&
+        static_cast<int>(online_loop_backend->pendingOnlineKeyframeCount()) >= online_loop_min_new_keyframes)
+    {
+      std::string error;
+      if (online_loop_backend->runOnce(&error))
+      {
+        LoopBackendResult result;
+        if (online_loop_backend->getLatestResult(&result)) publishOnlineLoopResult(result);
+      }
+      else if (!error.empty())
+      {
+        ROS_ERROR("Online loop-backend optimization failed: %s", error.c_str());
+      }
+    }
+    rate.sleep();
+  }
+}
+
+void LIVMapper::publishOnlineLoopResult(const LoopBackendResult &result)
+{
+  if (result.keyframes.empty() ||
+      result.keyframes.size() != result.optimized_imu_poses.size() ||
+      !result.global_keyframe_map)
+  {
+    ROS_WARN("Online loop-backend produced an incomplete result generation.");
+    return;
+  }
+
+  const ros::Time stamp = ros::Time::now();
+  nav_msgs::Path optimized_path;
+  optimized_path.header.stamp = stamp;
+  optimized_path.header.frame_id = "map";
+  optimized_path.poses.reserve(result.keyframes.size());
+  for (std::size_t index = 0; index < result.keyframes.size(); ++index)
+  {
+    geometry_msgs::PoseStamped pose;
+    pose.header.stamp.fromSec(result.keyframes[index].timestamp);
+    pose.header.frame_id = "map";
+    const Eigen::Vector3d translation = result.optimized_imu_poses[index].translation();
+    const Eigen::Quaterniond rotation(result.optimized_imu_poses[index].rotation());
+    pose.pose.position.x = translation.x();
+    pose.pose.position.y = translation.y();
+    pose.pose.position.z = translation.z();
+    pose.pose.orientation.x = rotation.x();
+    pose.pose.orientation.y = rotation.y();
+    pose.pose.orientation.z = rotation.z();
+    pose.pose.orientation.w = rotation.w();
+    optimized_path.poses.push_back(pose);
+  }
+  pubLoopOptimizedPath.publish(optimized_path);
+
+  sensor_msgs::PointCloud2 map_message;
+  pcl::toROSMsg(*result.global_keyframe_map, map_message);
+  map_message.header.stamp = stamp;
+  map_message.header.frame_id = "map";
+  pubLoopKeyframeMap.publish(map_message);
+
+  const std::size_t latest = result.keyframes.size() - 1;
+  nav_msgs::Odometry optimized_odom;
+  optimized_odom.header.stamp = stamp;
+  optimized_odom.header.frame_id = "map";
+  optimized_odom.child_frame_id = "aft_mapped_optimized";
+  const Eigen::Vector3d latest_translation = result.optimized_imu_poses[latest].translation();
+  const Eigen::Quaterniond latest_rotation(result.optimized_imu_poses[latest].rotation());
+  optimized_odom.pose.pose.position.x = latest_translation.x();
+  optimized_odom.pose.pose.position.y = latest_translation.y();
+  optimized_odom.pose.pose.position.z = latest_translation.z();
+  optimized_odom.pose.pose.orientation.x = latest_rotation.x();
+  optimized_odom.pose.pose.orientation.y = latest_rotation.y();
+  optimized_odom.pose.pose.orientation.z = latest_rotation.z();
+  optimized_odom.pose.pose.orientation.w = latest_rotation.w();
+  pubLoopOptimizedOdom.publish(optimized_odom);
+
+  // 使用最新关键帧的校正量发布 map -> camera_init。
+  // 前端仍在 camera_init(odom) 中工作；该 TF 仅服务全局可视化和当前优化位姿。
+  const Eigen::Isometry3d T_map_odom = result.optimized_imu_poses[latest] *
+                                       result.keyframes[latest].T_odom_imu.inverse();
+  const Eigen::Quaterniond correction_rotation(T_map_odom.rotation());
+  static tf::TransformBroadcaster broadcaster;
+  tf::Transform correction;
+  correction.setOrigin(tf::Vector3(T_map_odom.translation().x(), T_map_odom.translation().y(),
+                                   T_map_odom.translation().z()));
+  correction.setRotation(tf::Quaternion(correction_rotation.x(), correction_rotation.y(),
+                                        correction_rotation.z(), correction_rotation.w()));
+  broadcaster.sendTransform(tf::StampedTransform(correction, stamp, "map", "camera_init"));
+
+  visualization_msgs::MarkerArray edge_markers;
+  visualization_msgs::Marker edges;
+  edges.header.stamp = stamp;
+  edges.header.frame_id = "map";
+  edges.ns = "loop_backend";
+  edges.id = 0;
+  edges.type = visualization_msgs::Marker::LINE_LIST;
+  edges.action = visualization_msgs::Marker::ADD;
+  edges.scale.x = 0.08;
+  edges.color.r = 1.0;
+  edges.color.g = 0.2;
+  edges.color.b = 0.0;
+  edges.color.a = 1.0;
+  for (const LoopEdgeReport &edge : result.loop_edges)
+  {
+    std::size_t current_index = result.keyframes.size();
+    std::size_t history_index = result.keyframes.size();
+    for (std::size_t index = 0; index < result.keyframes.size(); ++index)
+    {
+      if (result.keyframes[index].id == edge.current_id) current_index = index;
+      if (result.keyframes[index].id == edge.history_id) history_index = index;
+    }
+    if (current_index == result.keyframes.size() || history_index == result.keyframes.size()) continue;
+
+    geometry_msgs::Point current_point;
+    geometry_msgs::Point history_point;
+    current_point.x = result.optimized_imu_poses[current_index].translation().x();
+    current_point.y = result.optimized_imu_poses[current_index].translation().y();
+    current_point.z = result.optimized_imu_poses[current_index].translation().z();
+    history_point.x = result.optimized_imu_poses[history_index].translation().x();
+    history_point.y = result.optimized_imu_poses[history_index].translation().y();
+    history_point.z = result.optimized_imu_poses[history_index].translation().z();
+    edges.points.push_back(current_point);
+    edges.points.push_back(history_point);
+  }
+  edge_markers.markers.push_back(edges);
+  pubLoopConstraintEdges.publish(edge_markers);
+
+  ROS_INFO("[loop-backend] Published generation %llu: %zu keyframes, %zu loop edges.",
+           static_cast<unsigned long long>(result.generation), result.keyframes.size(), result.loop_edges.size());
+}
+#endif
+
+void LIVMapper::saveLoopClosureKeyframe()
+{
+  bool online_backend_ready = false;
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  online_backend_ready = online_loop_enable && static_cast<bool>(online_loop_backend);
+#endif
+  if ((!keyframe_save_en || !keyframe_output_ready) && !online_backend_ready) return;
+  if (feats_down_body->empty()) return;
+
+  const double timestamp = LidarMeasures.last_lio_update_time;
+  if (timestamp - _first_lidar_time < keyframe_skip_initialization) return;
+
+  bool should_save = !has_last_keyframe;
+  if (has_last_keyframe)
+  {
+    const double elapsed = timestamp - last_keyframe_time;
+    if (elapsed < keyframe_min_interval) return;
+
+    const double translation = (_state.pos_end - last_keyframe_pos).norm();
+    const Eigen::AngleAxisd rotation_delta(last_keyframe_rot.transpose() * _state.rot_end);
+    const double rotation_deg = rotation_delta.angle() * 180.0 / std::acos(-1.0);
+    should_save = translation >= keyframe_translation_thresh || rotation_deg >= keyframe_rotation_thresh_deg;
+  }
+  if (!should_save) return;
+
+  if (keyframe_save_en && keyframe_output_ready)
+  {
+    std::ostringstream filename;
+    filename << keyframe_output_dir << "/" << std::setfill('0') << std::setw(6) << keyframe_id << ".pcd";
+    pcl::PCDWriter writer;
+    if (writer.writeBinary(filename.str(), *feats_down_body) != 0)
+    {
+      ROS_ERROR("Failed to write loop-closure keyframe: %s", filename.str().c_str());
+      return;
+    }
+
+    const Eigen::Quaterniond q(_state.rot_end);
+    fout_keyframe_pose << std::fixed << std::setprecision(9)
+                       << keyframe_id << " " << timestamp << " "
+                       << _state.pos_end[0] << " " << _state.pos_end[1] << " " << _state.pos_end[2] << " "
+                       << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+    fout_keyframe_pose.flush();
+  }
+
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  if (online_backend_ready)
+  {
+    Eigen::Isometry3d T_odom_imu = Eigen::Isometry3d::Identity();
+    T_odom_imu.linear() = _state.rot_end;
+    T_odom_imu.translation() = _state.pos_end;
+    std::string error;
+    if (!online_loop_backend->enqueueOnlineKeyframe(keyframe_id, timestamp, feats_down_body, T_odom_imu, &error))
+    {
+      ROS_ERROR("Failed to enqueue online loop keyframe %d: %s", keyframe_id, error.c_str());
+    }
+  }
+#endif
+
+  last_keyframe_time = timestamp;
+  last_keyframe_pos = _state.pos_end;
+  last_keyframe_rot = _state.rot_end;
+  has_last_keyframe = true;
+  ++keyframe_id;
+}
+
 void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it) 
 {
   sub_pcl = p_pre->lidar_type == AVIA ? 
@@ -218,6 +958,13 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
   voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  pubLoopOptimizedPath = nh.advertise<nav_msgs::Path>("/loop_backend/optimized_path", 1, true);
+  pubLoopKeyframeMap = nh.advertise<sensor_msgs::PointCloud2>("/loop_backend/global_keyframe_map", 1, true);
+  pubLoopOptimizedOdom = nh.advertise<nav_msgs::Odometry>("/loop_backend/optimized_odom", 1);
+  pubLoopConstraintEdges = nh.advertise<visualization_msgs::MarkerArray>("/loop_backend/loop_edges", 1, true);
+  startOnlineLoopBackend();
+#endif
 }
 
 void LIVMapper::handleFirstFrame() 
@@ -374,6 +1121,7 @@ void LIVMapper::handleLIO()
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
+  saveLoopClosureKeyframe();
 
   double t2 = omp_get_wtime();
 
@@ -537,6 +1285,7 @@ void LIVMapper::savePCD()
 
 void LIVMapper::run() 
 {
+  startDenseRgbCacheWriter();
   ros::Rate rate(5000);
   while (ros::ok()) 
   {
@@ -554,7 +1303,13 @@ void LIVMapper::run()
 
     stateEstimationAndMapping();
   }
+#ifdef FAST_LIVO_HAS_LOOP_BACKEND
+  stopOnlineLoopBackend();
+#endif
+  stopDenseRgbCacheWriter();
+  exportDenseRgbMapOnShutdown();
   savePCD();
+  cleanupC2IntermediateFiles();
 }
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
@@ -1231,19 +1986,40 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
     }
   }
 
-  /*** Publish Frame ***/
-  sensor_msgs::PointCloud2 laserCloudmsg;
-  if (slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == VIO)
+  // C1 records precisely the colored batches that are accumulated into the
+  // raw RGB map.  They remain in the original camera_init frame; the offline
+  // exporter later applies the time-interpolated map<-odom correction.
+  if (dense_rgb_cache_enabled && LidarMeasures.lio_vio_flg == VIO && !laserCloudWorldRGB->empty())
   {
-    pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
+    enqueueDenseRgbCache(laserCloudWorldRGB, LidarMeasures.measures.back().vio_time);
   }
-  if (slam_mode_ == ONLY_LIO || slam_mode_ == ONLY_LO)
-  { 
-    pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg); 
+
+  /*** Publish Frame ***/
+  const bool visual_update = slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == VIO;
+  const bool lidar_only_mode = slam_mode_ == ONLY_LIO || slam_mode_ == ONLY_LO;
+  const bool has_publishable_cloud =
+      (visual_update && !laserCloudWorldRGB->empty()) ||
+      (lidar_only_mode && !pcl_w_wait_pub->empty());
+
+  // VIO frames are accumulated according to pub_scan_num. Do not publish an
+  // intermediate empty PointCloud2, because it clears RViz's current display.
+  if (has_publishable_cloud && pubLaserCloudFullRes.getNumSubscribers() > 0)
+  {
+    sensor_msgs::PointCloud2 laserCloudmsg;
+    if (visual_update)
+    {
+      pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
+    }
+    else
+    {
+      pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg);
+    }
+    const double sensor_timestamp = LidarMeasures.lio_vio_flg == VIO ?
+        LidarMeasures.measures.back().vio_time : LidarMeasures.measures.back().lio_time;
+    laserCloudmsg.header.stamp.fromSec(sensor_timestamp);
+    laserCloudmsg.header.frame_id = "camera_init";
+    pubLaserCloudFullRes.publish(laserCloudmsg);
   }
-  laserCloudmsg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
-  laserCloudmsg.header.frame_id = "camera_init";
-  pubLaserCloudFullRes.publish(laserCloudmsg);
 
   /**************** save map ****************/
   /* 1. make sure you have enough memories
@@ -1394,7 +2170,7 @@ void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
 {
   odomAftMapped.header.frame_id = "camera_init";
   odomAftMapped.child_frame_id = "aft_mapped";
-  odomAftMapped.header.stamp = ros::Time::now(); //.ros::Time()fromSec(last_timestamp_lidar);
+  odomAftMapped.header.stamp.fromSec(LidarMeasures.last_lio_update_time);
   set_posestamp(odomAftMapped.pose.pose);
 
   static tf::TransformBroadcaster br;

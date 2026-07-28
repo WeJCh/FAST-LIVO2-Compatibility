@@ -84,12 +84,72 @@ evo:
   seq_name: "robotdog"
   pose_output_en: false
 
+# M1：为离线回环保存 LiDAR 坐标系关键帧及同时刻的 IMU 位姿。
+# 每次新建图请使用新的 keyframe_dir；默认禁止覆盖已有位姿文件，防止混入旧关键帧。
+loop_closure:
+  keyframe_save_en: true
+  # C2 使用独立目录，避免与已验证的 C1 结果混用。
+  keyframe_dir: "Log/pcd/keyframes_robotdog_c2"
+  keyframe_overwrite: false
+  keyframe_translation_m: 1.5
+  keyframe_rotation_deg: 10.0
+  keyframe_min_interval_s: 0.5
+  skip_initialization_s: 5.0
+
+# 阶段 B：在线回环后端。
+# 前端仍固定在 camera_init(odom) 中连续定位；本模块仅发布 map 中的优化结果，
+# 不会修改 FAST-LIVO2 的 _state 或活动体素地图。
+loop_backend:
+  online_enable: true
+  # 后台轮询频率；单次优化在独立线程运行，不阻塞 LIO/VIO 前端。
+  online_frequency_hz: 0.2
+  # 累积至少这么多新关键帧后才重新构建快照，控制在线计算开销。
+  online_min_new_keyframes: 5
+  # 阶段 B.5：收到 Ctrl-C 后冲刷尾部关键帧、最终优化并自动导出阶段 A 同格式结果。
+  export_on_shutdown: true
+  # 每次新建图请改为新目录；默认不覆盖旧的最终优化结果。
+  output_dir: "Log/loop_online_final_robotdog_c2"
+  output_overwrite: false
+
+  # 以下参数与阶段 A 离线工具一致，已由机器狗首尾回环数据验证。
+  candidate_radius_m: 10.0
+  min_time_separation_s: 30.0
+  min_keyframe_index_gap: 20
+  history_keyframes_each_side: 20
+  icp_voxel_leaf_m: 0.40
+  icp_max_correspondence_m: 150.0
+  icp_max_iterations: 100
+  icp_fitness_threshold: 0.40
+  min_current_points: 100
+  min_history_points: 300
+  odom_rotation_sigma_rad: 0.02
+  odom_translation_sigma_m: 0.10
+  loop_rotation_sigma_rad: 0.10
+  loop_translation_sigma_min_m: 0.05
+  loop_translation_sigma_max_m: 1.00
+  # 在线发布的全局关键帧地图体素大小；它不影响前端局部地图。
+  global_map_leaf_m: 0.20
+
+# 阶段 C2：在建图时缓存彩色世界系点云批次；Ctrl-C 后 B.5 优化完成即自动导出最终地图。
+dense_global_map:
+  enabled: true
+  cache_dir: "Log/dense_rgb_cache_robotdog_c2"
+  # 队列满时短暂等待磁盘写入，以确保稠密 RGB 点不丢失。
+  cache_queue_size: 8
+  # 0 表示不降采样：保留所有 RGB 点，与 all_raw_points.pcd 的稠密度一致。
+  auto_export_on_shutdown: true
+  auto_export_voxel_leaf_m: 0.0
+  # 所有最终交付结果统一放在 Log/pcd，与原 FAST-LIVO2 的组织方式一致。
+  output_path: "Log/pcd/all_global_optimized_rgb_dense_full.pcd"
+  # 仅在最终稠密 RGB PCD 成功后删除缓存、关键帧、稀疏中间地图和原始轨迹文本。
+  cleanup_intermediate_on_success: true
+
 pcd_save:
   # 导出建图结果给远程查看时开启；正常退出后保存 Log/pcd 下的 PCD 地图和轨迹。
   pcd_save_en: true
   type: 0 # 0: World Frame, 1: Body Frame
   colmap_output_en: false
-  filter_size_pcd: 0.15
+  filter_size_pcd: 0.20
   interval: -1
 
 image_save:
