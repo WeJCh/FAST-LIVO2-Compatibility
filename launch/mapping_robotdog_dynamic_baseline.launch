@@ -1,0 +1,55 @@
+<launch>
+  <!--
+    Raw baseline mapper for dynamic-removal comparison.  Unlike
+    mapping_robotdog.launch it isolates
+    artifacts for an explicitly named comparison run.  It always consumes the
+    original /front_lidar; filtered input remains exclusive to
+    mapping_robotdog_dynamic.launch.
+  -->
+  <arg name="rviz" default="false"/>
+  <arg name="img_en" default="0"/>
+  <arg name="dynamic_run_dir" default="Log/dynamic_raw_UNSET"/>
+  <!-- Default-off: long, image-enabled dense-RGB output is enabled only for the
+       authorised full-map comparison and remains isolated under run_dir. -->
+  <arg name="full_rgb_map" default="false"/>
+
+  <rosparam command="load" file="$(find fast_livo)/config/robotdog.yaml"/>
+  <param name="/common/lid_topic" value="/front_lidar" type="str"/>
+  <param name="/common/img_en" value="$(arg img_en)" type="int"/>
+  <param name="/pcd_save/output_dir" value="$(arg dynamic_run_dir)/map" type="str"/>
+
+  <group unless="$(arg full_rgb_map)">
+    <!-- Keep the short comparison independent from dense-RGB products. -->
+    <param name="/loop_closure/keyframe_save_en" value="false" type="bool"/>
+    <param name="/loop_backend/online_enable" value="false" type="bool"/>
+    <param name="/dense_global_map/enabled" value="false" type="bool"/>
+  </group>
+
+  <group if="$(arg full_rgb_map)">
+    <!-- The dense-RGB pipeline produces the requested final PCD itself. Do not also retain
+         all_raw_points.pcd and all_downsampled_points.pcd for this run. -->
+    <param name="/pcd_save/pcd_save_en" value="false" type="bool"/>
+    <param name="/loop_closure/keyframe_save_en" value="true" type="bool"/>
+    <param name="/loop_closure/keyframe_dir" value="$(arg dynamic_run_dir)/keyframes" type="str"/>
+    <param name="/loop_closure/keyframe_overwrite" value="false" type="bool"/>
+    <param name="/loop_backend/online_enable" value="true" type="bool"/>
+    <param name="/loop_backend/export_on_shutdown" value="true" type="bool"/>
+    <param name="/loop_backend/output_dir" value="$(arg dynamic_run_dir)/loop_online_final" type="str"/>
+    <param name="/loop_backend/output_overwrite" value="false" type="bool"/>
+    <param name="/dense_global_map/enabled" value="true" type="bool"/>
+    <param name="/dense_global_map/cache_dir" value="$(arg dynamic_run_dir)/dense_rgb_cache" type="str"/>
+    <param name="/dense_global_map/auto_export_on_shutdown" value="true" type="bool"/>
+    <param name="/dense_global_map/output_path"
+           value="$(arg dynamic_run_dir)/map/all_global_optimized_rgb_dense_full.pcd" type="str"/>
+    <param name="/dense_global_map/cleanup_intermediate_on_success" value="true" type="bool"/>
+  </group>
+
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+    <rosparam file="$(find fast_livo)/config/camera_pinhole.yaml"/>
+  </node>
+
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
+          args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz"/>
+  </group>
+</launch>

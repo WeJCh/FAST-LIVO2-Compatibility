@@ -221,6 +221,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
 
   nh.param<bool>("pcd_save/colmap_output_en", colmap_output_en, false);
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
+  nh.param<string>("pcd_save/output_dir", pcd_output_dir, "Log/pcd");
 
   nh.param<bool>("loop_closure/keyframe_save_en", keyframe_save_en, false);
   nh.param<string>("loop_closure/keyframe_dir", keyframe_dir, "Log/pcd/keyframes");
@@ -308,6 +309,15 @@ void LIVMapper::initializeComponents()
 
 void LIVMapper::initializeFiles() 
 {
+  if (pcd_output_dir.empty()) pcd_output_dir = "Log/pcd";
+  if (pcd_output_dir.front() != '/') pcd_output_dir = std::string(ROOT_DIR) + pcd_output_dir;
+  // 自动稠密 RGB 导出可能是唯一请求的地图产物（部分对比模式会关闭原始 PCD 保存）。
+  // Its final output still needs this parent directory before shutdown.
+  if ((pcd_save_en || (dense_rgb_cache_enabled && dense_rgb_auto_export_on_shutdown)) &&
+      !createDirectoryRecursively(pcd_output_dir))
+  {
+    throw std::runtime_error("Cannot create pcd_save/output_dir: " + pcd_output_dir);
+  }
   if (pcd_save_en && colmap_output_en)
   {
       const std::string folderPath = std::string(ROOT_DIR) + "/scripts/colmap_output.sh";
@@ -327,7 +337,7 @@ void LIVMapper::initializeFiles()
       }
   }
   if(colmap_output_en) fout_points.open(std::string(ROOT_DIR) + "Log/Colmap/sparse/0/points3D.txt", std::ios::out);
-  if(pcd_save_en) fout_lidar_pos.open(std::string(ROOT_DIR) + "Log/pcd/lidar_poses.txt", std::ios::out);
+  if(pcd_save_en) fout_lidar_pos.open(pcd_output_dir + "/lidar_poses.txt", std::ios::out);
   if(img_save_en) fout_visual_pos.open(std::string(ROOT_DIR) + "Log/image/image_poses.txt", std::ios::out);
   fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), std::ios::out);
   fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), std::ios::out);
@@ -418,7 +428,7 @@ void LIVMapper::startDenseRgbCacheWriter()
     return;
   }
 
-  // manifest.csv is the complete input contract of the offline C1 exporter.
+  // manifest.csv 记录每个 RGB 批次与其时间戳，是全局重投影的完整输入索引。
   // Old frame files are harmless: only entries from this newly created manifest are read.
   std::ofstream manifest(dense_rgb_cache_dir + "/manifest.csv", std::ios::out | std::ios::trunc);
   if (!manifest.is_open())
@@ -544,7 +554,7 @@ void LIVMapper::exportDenseRgbMapOnShutdown()
   config.raw_keyframe_pose_path = keyframe_output_dir + "/keyframe_poses_imu.txt";
   config.optimized_keyframe_pose_path = online_loop_final_output_dir + "/optimized_keyframe_poses_imu.txt";
   config.output_path = dense_rgb_output_path.empty()
-      ? std::string(ROOT_DIR) + "Log/pcd/all_global_optimized_rgb_dense_full.pcd"
+      ? pcd_output_dir + "/all_global_optimized_rgb_dense_full.pcd"
       : dense_rgb_output_path;
   config.voxel_leaf_m = dense_rgb_auto_export_voxel_leaf_m;
 
@@ -562,21 +572,21 @@ void LIVMapper::exportDenseRgbMapOnShutdown()
 #endif
 }
 
-void LIVMapper::cleanupC2IntermediateFiles()
+void LIVMapper::cleanupLoopIntermediateFiles()
 {
   if (!dense_rgb_cleanup_intermediate_on_success || !dense_rgb_auto_export_succeeded) return;
 
-  // 仅在最终稠密 PCD 已成功写入后清理，失败时保留所有输入便于离线恢复。
+  // 仅在最终稠密 PCD 已成功写入后清理；失败时保留所有输入便于定位问题。
   if (fout_keyframe_pose.is_open()) fout_keyframe_pose.close();
   if (fout_lidar_pos.is_open()) fout_lidar_pos.close();
 
-  const std::string pcd_dir = std::string(ROOT_DIR) + "Log/pcd";
+  const std::string pcd_dir = pcd_output_dir;
 #ifdef FAST_LIVO_HAS_LOOP_BACKEND
   const std::string optimized_pose_source = online_loop_final_output_dir + "/optimized_keyframe_poses_imu.txt";
   const std::string optimized_pose_target = pcd_dir + "/optimized_keyframe_poses_imu.txt";
   if (!online_loop_final_output_dir.empty() && !copyGeneratedFile(optimized_pose_source, optimized_pose_target))
   {
-    ROS_ERROR("[dense-rgb] C2 cleanup skipped: final optimized trajectory could not be copied.");
+    ROS_ERROR("[dense-rgb] Intermediate cleanup skipped: final optimized trajectory could not be copied.");
     return;
   }
 #endif
@@ -609,11 +619,11 @@ void LIVMapper::cleanupC2IntermediateFiles()
 
   if (success)
   {
-    ROS_INFO("[dense-rgb] C2 cleanup complete. Kept raw map, downsampled map, final dense RGB map, and optimized trajectory.");
+    ROS_INFO("[dense-rgb] Intermediate cleanup complete. Kept raw map, downsampled map, final dense RGB map, and optimized trajectory.");
   }
   else
   {
-    ROS_WARN("[dense-rgb] C2 export succeeded, but some intermediate files could not be removed.");
+    ROS_WARN("[dense-rgb] Final export succeeded, but some intermediate files could not be removed.");
   }
 }
 
@@ -622,7 +632,7 @@ void LIVMapper::initializeOnlineLoopBackend()
 {
   if (!online_loop_enable) return;
 
-  // 在线参数与离线工具使用同一组语义，便于先用阶段 A 验证，再平滑迁移到阶段 B。
+  // 在线回环参数由 ROS 配置统一加载。
   ros::NodeHandle nh;
   LoopBackendConfig config;
   nh.param<double>("loop_backend/candidate_radius_m", config.candidate_radius_m, config.candidate_radius_m);
@@ -1237,8 +1247,8 @@ void LIVMapper::savePCD()
 {
   if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0) 
   {
-    std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_raw_points.pcd";
-    std::string downsampled_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_downsampled_points.pcd";
+    std::string raw_points_dir = pcd_output_dir + "/all_raw_points.pcd";
+    std::string downsampled_points_dir = pcd_output_dir + "/all_downsampled_points.pcd";
     pcl::PCDWriter pcd_writer;
 
     if (img_en)
@@ -1309,7 +1319,7 @@ void LIVMapper::run()
   stopDenseRgbCacheWriter();
   exportDenseRgbMapOnShutdown();
   savePCD();
-  cleanupC2IntermediateFiles();
+  cleanupLoopIntermediateFiles();
 }
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
@@ -1588,8 +1598,11 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
 cv::Mat LIVMapper::getImageFromCompressedMsg(const sensor_msgs::CompressedImageConstPtr &img_msg)
 {
   // 压缩图像只在进入视觉前端前解码为 BGR，消息时间戳仍由回调中的 header.stamp 提供。
+  // Do not wrap img_msg->data with a non-owning cv::Mat here.  The ROS callback
+  // and OpenCV decoder have different buffer lifetimes; a private JPEG copy
+  // prevents an OpenCV/libjpeg cleanup path from touching ROS-owned storage.
   if (img_msg->data.empty()) return cv::Mat();
-  cv::Mat encoded(1, static_cast<int>(img_msg->data.size()), CV_8UC1, const_cast<uint8_t *>(img_msg->data.data()));
+  const std::vector<uint8_t> encoded(img_msg->data.begin(), img_msg->data.end());
   return cv::imdecode(encoded, cv::IMREAD_COLOR);
 }
 
@@ -1986,9 +1999,8 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
     }
   }
 
-  // C1 records precisely the colored batches that are accumulated into the
-  // raw RGB map.  They remain in the original camera_init frame; the offline
-  // exporter later applies the time-interpolated map<-odom correction.
+  // 记录与原始 RGB 地图一致的彩色点云批次。它们保留在原始 camera_init
+  // 坐标系，最终导出时再应用按时间插值的 map<-odom 校正。
   if (dense_rgb_cache_enabled && LidarMeasures.lio_vio_flg == VIO && !laserCloudWorldRGB->empty())
   {
     enqueueDenseRgbCache(laserCloudWorldRGB, LidarMeasures.measures.back().vio_time);
@@ -2075,7 +2087,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
     }
     if ((pcl_wait_save->size() > 0 || pcl_wait_save_intensity->size() > 0) && pcd_save_interval > 0 && scan_wait_num >= pcd_save_interval)
     {
-      string all_points_dir(string(string(ROOT_DIR) + "Log/pcd/") + ss_time.str() + string(".pcd"));
+      string all_points_dir(pcd_output_dir + "/" + ss_time.str() + ".pcd");
 
       pcl::PCDWriter pcd_writer;
 

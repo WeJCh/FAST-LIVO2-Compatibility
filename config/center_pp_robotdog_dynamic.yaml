@@ -1,0 +1,112 @@
+# CenterPoint dynamic-removal configuration: motion gating and local-ground
+# protection.  The default mapper keeps consuming /front_lidar; only the
+# dedicated mapping_robotdog_dynamic.launch consumes filtered_points.
+center_pp:
+  mode:
+    # static_points is always a byte-identical input baseline.  The dynamic
+    # removal mode below takes precedence inside centerpp_node.
+    detect_only: true
+
+  dynamic_removal:
+    enable: true
+
+    # Same LiDAR -> IMU calibration as config/robotdog.yaml, stored privately
+    # so this launch never overwrites /common/img_en in fastlivo_mapping.
+    lidar_to_imu_T: [-0.011, -0.02329, 0.04412]
+    lidar_to_imu_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+
+    # A semantic car/pedestrian/cyclist is NOT moving by default.  Association
+    # and motion are evaluated after converting box centers with the continuous
+    # FAST-LIVO2 /aft_mapped_to_init odometry.
+    motion_window_sec: 1.5
+    track_timeout_sec: 1.0
+    association_distance_m: 2.0
+    # FAST-LIVO2 may publish odometry less often than the LiDAR callback.  A
+    # bracketing pair is interpolated only over this bounded interval; a single
+    # stale pose is still rejected after odom_max_time_delta_sec.
+    odom_max_time_delta_sec: 0.10
+    odom_interpolation_max_gap_sec: 0.60
+    odom_wait_wall_sec: 0.50
+    min_observations: 6
+    min_duration_sec: 0.6
+    static_speed_max_mps: 0.35
+    moving_speed_min_mps: 0.80
+
+    # A valid local plane must be found in the ring around a confirmed moving
+    # object.  Points close to that plane are published as protected_ground and
+    # are never removed.  Failure to estimate the plane preserves the object.
+    # Validated on the RobotDog dynamic-removal positive window: 1.5 m
+    # reduces insufficient-ring rejects while preserving inspected road points
+    # and all observed static candidates.
+    ground_search_margin_m: 1.5
+    ground_min_inliers: 50
+    ground_ransac_distance_m: 0.12
+    ground_keep_distance_m: 0.18
+    # A near-horizontal plane is not automatically road: vehicle roofs,
+    # hoods and steps can also satisfy RANSAC.  The estimated plane height at
+    # the box center must remain near the detector box bottom; otherwise the
+    # whole moving candidate is preserved rather than risking road deletion.
+    ground_max_height_above_box_bottom_m: 0.25
+    ground_max_height_below_box_bottom_m: 0.50
+    # Even after plane validation, only the lower portion of a confirmed
+    # moving box may be protected.  This prevents a high accidental plane from
+    # retaining a pedestrian torso as "ground".
+    ground_protect_max_height_above_box_bottom_m: 0.35
+
+  frame:
+    odom_frame: camera_init
+    child_frame: aft_mapped
+    use_input_frame: true
+
+  preprocessing:
+    threshold:
+      MINIMUM_RANGE: 0.8
+      MAXMUM_RANGE: 100000
+    # Never run the reference project CropBox / VoxelGrid preprocessing in
+    # dynamic removal.  It would create map thinning unrelated to this module.
+    cropBoxFilter:
+      use: false
+      size: 0.5
+    voxelFilter:
+      use: false
+      res: 0.25
+
+  filter_history:
+    # History-box deletion remains prohibited.  The module tracks only box
+    # centers for motion evidence; it does not merge historical boxes.
+    coast_time_sec: 0.0
+    coast_max_frames: 0
+    inflate_ratio: 0.12
+    inflate_m: 0.25
+    merge_center_thresh: 0.5
+
+  runtime:
+    # The ROS2-to-ROS1 player preserves acquisition stamps and has no /clock.
+    max_input_lag_sec: -1.0
+    # The runtime receives PointCloud2 in this ROS subscriber queue before the
+    # callback can assign its observable seq.  A larger value reduces normal
+    # burst loss, but it is not a proof of losslessness; the short-bag checker
+    # compares the independently recorded /front_lidar with node outputs.
+    input_subscriber_queue_size: 8
+    # Same caveat applies to ROS publisher queues.  This only reduces local
+    # transport loss; the independent bag comparison remains authoritative.
+    output_publisher_queue_size: 8
+    # At most this many frames (including the active worker frame) may be
+    # admitted to inference.  Later frames stay in sequence order but become
+    # raw passthrough results; they are never erased from the output FIFO.
+    inference_queue_capacity: 3
+    # Conservative per-frame safety budget.  A slower inference result is
+    # discarded and this same frame is passed through; it never feeds a later
+    # scan.  The normal safety bag establishes whether 500 ms is appropriate
+    # for the deployed GPU before this setting is used on live input.
+    inference_budget_ms: 500.0
+
+    # Default-off deterministic runtime test hooks.  They never alter motion,
+    # ground, class, or box thresholds.
+    test_inject_delay_ms: 0
+    test_inject_exception_seq: -1
+    test_force_odom_unavailable: false
+    test_force_empty_detections: false
+
+  save_dir: /tmp/fast_livo_centerpoint_dynamic
+  save_on_shutdown: false

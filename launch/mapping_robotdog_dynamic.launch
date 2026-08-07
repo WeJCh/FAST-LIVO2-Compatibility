@@ -1,0 +1,78 @@
+<launch>
+  <!--
+    Controlled dynamic-removal mapper input.
+
+    Start centerpp_robotdog_dynamic.launch separately.  That node must keep
+    consuming the original /front_lidar and publishing
+    /dynamic_removal/filtered_points.  This launch intentionally starts only
+    fastlivo_mapping, so the filtered path and the original baseline
+    remain explicit and independently controllable.
+  -->
+  <arg name="rviz" default="true"/>
+  <!-- Use img_en:=0 for the first LiDAR/IMU-only short-bag validation. -->
+  <arg name="img_en" default="1"/>
+  <!--
+    Optional result root, relative to the package unless absolute.  The
+    default remains a front-end-only comparison; set full_rgb_map:=true only
+    for a full RGB-map comparison.
+  -->
+  <arg name="dynamic_run_dir" default=""/>
+  <arg name="full_rgb_map" default="false"/>
+
+  <!--
+    robotdog.yaml establishes the complete RobotDog contract, including
+    lidar_type: 8 and the original IMU topic.  This must precede the one
+    controlled override below: LIVMapper reads /common/lid_topic at startup.
+  -->
+  <rosparam command="load" file="$(find fast_livo)/config/robotdog.yaml"/>
+  <param name="/common/lid_topic" value="/dynamic_removal/filtered_points" type="str"/>
+  <param name="/common/img_en" value="$(arg img_en)" type="int"/>
+
+  <group if="$(eval arg('dynamic_run_dir') != '')">
+    <param name="/pcd_save/output_dir" value="$(arg dynamic_run_dir)/map" type="str"/>
+  </group>
+
+  <!-- The default comparison mode is intentionally front-end-only.  Use native
+       ROS boolean groups rather than string equality inside $(eval): launch
+       callers may spell boolean values with different case. -->
+  <group unless="$(arg full_rgb_map)">
+    <group if="$(eval arg('dynamic_run_dir') != '')">
+      <param name="/loop_closure/keyframe_save_en" value="false" type="bool"/>
+      <param name="/loop_backend/online_enable" value="false" type="bool"/>
+      <param name="/dense_global_map/enabled" value="false" type="bool"/>
+    </group>
+  </group>
+
+  <!-- Full-map mode is default-off because it performs long dense-RGB export.
+       Every mutable output path is isolated per raw/filtered run. -->
+  <group if="$(arg full_rgb_map)">
+    <group if="$(eval arg('dynamic_run_dir') != '')">
+      <!-- The final dense RGB PCD is generated from RGB cache/keyframes, not
+           pcd_save.  Avoid retaining a second raw/downsampled map per run. -->
+      <param name="/pcd_save/pcd_save_en" value="false" type="bool"/>
+      <param name="/loop_closure/keyframe_save_en" value="true" type="bool"/>
+      <param name="/loop_closure/keyframe_dir" value="$(arg dynamic_run_dir)/keyframes" type="str"/>
+      <param name="/loop_closure/keyframe_overwrite" value="false" type="bool"/>
+      <param name="/loop_backend/online_enable" value="true" type="bool"/>
+      <param name="/loop_backend/export_on_shutdown" value="true" type="bool"/>
+      <param name="/loop_backend/output_dir" value="$(arg dynamic_run_dir)/loop_online_final" type="str"/>
+      <param name="/loop_backend/output_overwrite" value="false" type="bool"/>
+      <param name="/dense_global_map/enabled" value="true" type="bool"/>
+      <param name="/dense_global_map/cache_dir" value="$(arg dynamic_run_dir)/dense_rgb_cache" type="str"/>
+      <param name="/dense_global_map/auto_export_on_shutdown" value="true" type="bool"/>
+      <param name="/dense_global_map/output_path"
+             value="$(arg dynamic_run_dir)/map/all_global_optimized_rgb_dense_full.pcd" type="str"/>
+      <param name="/dense_global_map/cleanup_intermediate_on_success" value="true" type="bool"/>
+    </group>
+  </group>
+
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+    <!-- Keep camera loading identical to mapping_robotdog.launch. -->
+    <rosparam file="$(find fast_livo)/config/camera_pinhole.yaml"/>
+  </node>
+
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
+          args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz"/>
+  </group>
+</launch>

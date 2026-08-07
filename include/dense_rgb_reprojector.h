@@ -1,5 +1,5 @@
 /*
- * Phase C1 dense RGB global-map exporter.
+ * Dense RGB global-map exporter used by the automatic loop-closure workflow.
  *
  * Cached RGB clouds are already expressed in FAST-LIVO2's original odom
  * (camera_init) world frame.  This tool interpolates the correction field

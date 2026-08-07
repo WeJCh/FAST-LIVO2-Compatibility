@@ -12,6 +12,7 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/registration/icp.h>
+#include <tbb/global_control.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -28,15 +29,6 @@
 
 namespace
 {
-std::string trim(const std::string &text)
-{
-  const std::string whitespace = " \t\r\n";
-  const std::size_t first = text.find_first_not_of(whitespace);
-  if (first == std::string::npos) return std::string();
-  const std::size_t last = text.find_last_not_of(whitespace);
-  return text.substr(first, last - first + 1);
-}
-
 bool createDirectoryRecursively(const std::string &path)
 {
   if (path.empty()) return false;
@@ -64,21 +56,6 @@ bool createDirectoryRecursively(const std::string &path)
     start = end + 1;
   }
   return true;
-}
-
-std::vector<double> parseNumericList(std::string value)
-{
-  for (char &ch : value)
-  {
-    const bool numeric = (ch >= '0' && ch <= '9') || ch == '-' || ch == '+' ||
-                         ch == '.' || ch == 'e' || ch == 'E';
-    if (!numeric) ch = ' ';
-  }
-  std::stringstream stream(value);
-  std::vector<double> values;
-  double number = 0.0;
-  while (stream >> number) values.push_back(number);
-  return values;
 }
 
 gtsam::Pose3 toGtsam(const Eigen::Isometry3d &pose)
@@ -192,13 +169,13 @@ bool LoopBackend::exportLatestOnlineResult(const std::string &output_dir, std::s
     snapshot_extrinsic = T_imu_lidar_;
   }
 
-  // 复用阶段 A 的导出代码，保证在线自动导出与离线重跑的文件格式一致。
+  // 复用统一写出逻辑，确保后台快照与最终交付文件一致。
   LoopBackend exporter(config_);
   exporter.T_imu_lidar_ = snapshot_extrinsic;
   exporter.keyframes_ = snapshot.keyframes;
   exporter.optimized_imu_poses_ = snapshot.optimized_imu_poses;
   exporter.loop_edges_ = snapshot.loop_edges;
-  return exporter.exportResults(output_dir, error);
+  return exporter.writeResults(output_dir, error);
 }
 
 bool LoopBackend::runOnce(std::string *error)
@@ -245,153 +222,6 @@ bool LoopBackend::runOnce(std::string *error)
   return true;
 }
 
-bool LoopBackend::loadConfigFile(const std::string &path, LoopBackendConfig *config, std::string *error)
-{
-  if (config == nullptr)
-  {
-    if (error) *error = "LoopBackendConfig pointer is null.";
-    return false;
-  }
-  std::ifstream input(path);
-  if (!input.is_open())
-  {
-    if (error) *error = "Cannot open configuration file: " + path;
-    return false;
-  }
-
-  std::string line;
-  while (std::getline(input, line))
-  {
-    const std::size_t comment = line.find('#');
-    if (comment != std::string::npos) line.erase(comment);
-    const std::size_t colon = line.find(':');
-    if (colon == std::string::npos) continue;
-    const std::string key = trim(line.substr(0, colon));
-    const std::string value = trim(line.substr(colon + 1));
-    if (value.empty()) continue;
-
-    try
-    {
-      if (key == "candidate_radius_m") config->candidate_radius_m = std::stod(value);
-      else if (key == "min_time_separation_s") config->min_time_separation_s = std::stod(value);
-      else if (key == "min_keyframe_index_gap") config->min_keyframe_index_gap = std::stoi(value);
-      else if (key == "history_keyframes_each_side") config->history_keyframes_each_side = std::stoi(value);
-      else if (key == "icp_voxel_leaf_m") config->icp_voxel_leaf_m = std::stod(value);
-      else if (key == "icp_max_correspondence_m") config->icp_max_correspondence_m = std::stod(value);
-      else if (key == "icp_max_iterations") config->icp_max_iterations = std::stoi(value);
-      else if (key == "icp_fitness_threshold") config->icp_fitness_threshold = std::stod(value);
-      else if (key == "min_current_points") config->min_current_points = std::stoi(value);
-      else if (key == "min_history_points") config->min_history_points = std::stoi(value);
-      else if (key == "odom_rotation_sigma_rad") config->odom_rotation_sigma_rad = std::stod(value);
-      else if (key == "odom_translation_sigma_m") config->odom_translation_sigma_m = std::stod(value);
-      else if (key == "loop_rotation_sigma_rad") config->loop_rotation_sigma_rad = std::stod(value);
-      else if (key == "loop_translation_sigma_min_m") config->loop_translation_sigma_min_m = std::stod(value);
-      else if (key == "loop_translation_sigma_max_m") config->loop_translation_sigma_max_m = std::stod(value);
-      else if (key == "global_map_leaf_m") config->global_map_leaf_m = std::stod(value);
-    }
-    catch (const std::exception &)
-    {
-      if (error) *error = "Invalid value for loop-backend key '" + key + "' in " + path;
-      return false;
-    }
-  }
-  return true;
-}
-
-bool LoopBackend::loadImuLidarExtrinsic(const std::string &metadata_path, Eigen::Isometry3d *T_imu_lidar,
-                                         std::string *error) const
-{
-  std::ifstream input(metadata_path);
-  if (!input.is_open())
-  {
-    if (error) *error = "Cannot open keyframe metadata: " + metadata_path;
-    return false;
-  }
-
-  std::vector<double> translation;
-  std::vector<double> rotation;
-  std::string line;
-  while (std::getline(input, line))
-  {
-    const std::size_t colon = line.find(':');
-    if (colon == std::string::npos) continue;
-    const std::string key = trim(line.substr(0, colon));
-    if (key == "T_imu_lidar_translation") translation = parseNumericList(line.substr(colon + 1));
-    if (key == "T_imu_lidar_rotation_row_major") rotation = parseNumericList(line.substr(colon + 1));
-  }
-  if (translation.size() != 3 || rotation.size() != 9)
-  {
-    if (error) *error = "metadata.yaml is missing a valid T_imu_lidar translation or rotation.";
-    return false;
-  }
-
-  Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
-  transform.translation() = Eigen::Vector3d(translation[0], translation[1], translation[2]);
-  transform.linear() << rotation[0], rotation[1], rotation[2],
-                        rotation[3], rotation[4], rotation[5],
-                        rotation[6], rotation[7], rotation[8];
-  *T_imu_lidar = transform;
-  return true;
-}
-
-bool LoopBackend::loadKeyframes(const std::string &keyframe_dir, std::string *error)
-{
-  keyframes_.clear();
-  optimized_imu_poses_.clear();
-  loop_edges_.clear();
-
-  if (!loadImuLidarExtrinsic(keyframe_dir + "/metadata.yaml", &T_imu_lidar_, error)) return false;
-
-  std::ifstream pose_file(keyframe_dir + "/keyframe_poses_imu.txt");
-  if (!pose_file.is_open())
-  {
-    if (error) *error = "Cannot open keyframe pose file in: " + keyframe_dir;
-    return false;
-  }
-
-  int id = -1;
-  double timestamp = 0.0;
-  double tx = 0.0, ty = 0.0, tz = 0.0, qx = 0.0, qy = 0.0, qz = 0.0, qw = 1.0;
-  while (pose_file >> id >> timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw)
-  {
-    std::ostringstream cloud_path;
-    cloud_path << keyframe_dir << '/' << std::setfill('0') << std::setw(6) << id << ".pcd";
-    pcl::PointCloud<PointType>::Ptr cloud(new pcl::PointCloud<PointType>());
-    if (pcl::io::loadPCDFile(cloud_path.str(), *cloud) != 0)
-    {
-      if (error) *error = "Cannot read keyframe cloud: " + cloud_path.str();
-      return false;
-    }
-    if (cloud->empty()) continue;
-
-    Eigen::Quaterniond quaternion(qw, qx, qy, qz);
-    if (quaternion.norm() < 1e-9)
-    {
-      if (error) *error = "Invalid zero quaternion for keyframe " + std::to_string(id);
-      return false;
-    }
-    quaternion.normalize();
-
-    LoopKeyframe keyframe;
-    keyframe.id = id;
-    keyframe.timestamp = timestamp;
-    keyframe.cloud_lidar = cloud;
-    keyframe.T_odom_imu = Eigen::Isometry3d::Identity();
-    keyframe.T_odom_imu.linear() = quaternion.toRotationMatrix();
-    keyframe.T_odom_imu.translation() = Eigen::Vector3d(tx, ty, tz);
-    keyframe.T_odom_lidar = keyframe.T_odom_imu * T_imu_lidar_;
-    keyframes_.push_back(keyframe);
-  }
-
-  if (keyframes_.size() < 2)
-  {
-    if (error) *error = "Fewer than two readable keyframes were found.";
-    return false;
-  }
-  std::cout << "[loop-backend] Loaded " << keyframes_.size() << " keyframes from " << keyframe_dir << std::endl;
-  return true;
-}
-
 pcl::PointCloud<PointType>::Ptr LoopBackend::makeHistorySubmap(std::size_t center_index) const
 {
   pcl::PointCloud<PointType>::Ptr submap(new pcl::PointCloud<PointType>());
@@ -415,6 +245,14 @@ bool LoopBackend::optimize(std::string *error)
     if (error) *error = "Keyframes must be loaded before optimization.";
     return false;
   }
+
+  // The online optimizer shares a process with the OpenMP LIO frontend.  In
+  // the deployed GTSAM/TBB combination, parallel factor linearization corrupts
+  // the allocator state (see gtsam::NoiseModelFactor::linearize in the abort
+  // backtrace).  Keep this small background graph serial: it does not affect
+  // the LIO state or map, and avoids spawning TBB worker threads here.
+  const tbb::global_control serial_factor_linearization(
+      tbb::global_control::max_allowed_parallelism, 1);
 
   gtsam::NonlinearFactorGraph graph;
   gtsam::Values initial;
@@ -539,7 +377,7 @@ bool LoopBackend::optimize(std::string *error)
   return true;
 }
 
-bool LoopBackend::exportResults(const std::string &output_dir, std::string *error) const
+bool LoopBackend::writeResults(const std::string &output_dir, std::string *error) const
 {
   if (optimized_imu_poses_.size() != keyframes_.size())
   {

@@ -2,9 +2,13 @@
 <!-- Launch file for RobotDog original PointCloud2 + CompressedImage data -->
 
 	<arg name="rviz" default="true" />
+	<!-- Dynamic removal needs continuous LIO odometry.  Keep the normal camera
+	     path as the default; img_en:=0 is an explicit offline diagnostic mode. -->
+	<arg name="img_en" default="1" />
 
 	<!-- 机器狗原生输入配置：/front_lidar、/front_lidar/imu、/front_camera/image_compressed -->
 	<rosparam command="load" file="$(find fast_livo)/config/robotdog.yaml" />
+	<param name="/common/img_en" value="$(arg img_en)" type="int" />
 
 	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
 		<!-- 当前使用机器狗 front_camera 的针孔相机内参 -->

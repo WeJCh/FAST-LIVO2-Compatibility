@@ -1,0 +1,85 @@
+<launch>
+  <!--
+    The dynamic node always consumes the original /front_lidar.  Start either
+    mapping_robotdog.launch for the original baseline or the separate
+    mapping_robotdog_dynamic.launch for the controlled filtered input.
+    This launch never starts or remaps fastlivo_mapping.
+  -->
+  <arg name="pointcloud_topic" default="/front_lidar"/>
+  <arg name="odom_topic" default="/aft_mapped_to_init"/>
+  <arg name="model_dir" default="$(find fast_livo)/model/center_pointpillars/"/>
+  <arg name="tensorrt_lib" default="$(optenv TENSORRT_LIB /opt/TensorRT/lib)"/>
+  <!-- Runtime safety controls.  All fault-injection hooks default off. -->
+  <arg name="input_subscriber_queue_size" default="8"/>
+  <arg name="output_publisher_queue_size" default="8"/>
+  <arg name="inference_queue_capacity" default="3"/>
+  <arg name="inference_budget_ms" default="500.0"/>
+  <arg name="test_inject_delay_ms" default="0"/>
+  <arg name="test_inject_exception_seq" default="-1"/>
+  <arg name="test_force_odom_unavailable" default="false"/>
+  <arg name="test_force_empty_detections" default="false"/>
+  <!-- Controlled calibration overrides.  Every default equals the checked
+       configuration, so omitting them cannot change deployed behaviour. -->
+  <arg name="motion_min_observations" default="6"/>
+  <arg name="motion_min_duration_sec" default="0.6"/>
+  <arg name="static_speed_max_mps" default="0.35"/>
+  <arg name="moving_speed_min_mps" default="0.80"/>
+  <arg name="ground_search_margin_m" default="1.5"/>
+  <arg name="ground_min_inliers" default="50"/>
+
+  <env name="LD_LIBRARY_PATH" value="$(arg tensorrt_lib):$(optenv LD_LIBRARY_PATH)"/>
+
+  <node ns="fast_livo"
+        pkg="fast_livo"
+        type="centerpp_node"
+        name="centerpp_node_dynamic"
+        output="screen"
+        clear_params="true">
+    <param name="Model_File_Dir" type="string" value="$(arg model_dir)"/>
+    <rosparam file="$(find fast_livo)/config/center_pp_robotdog_dynamic.yaml" command="load"/>
+    <param name="center_pp/runtime/input_subscriber_queue_size"
+           value="$(arg input_subscriber_queue_size)" type="int"/>
+    <param name="center_pp/runtime/output_publisher_queue_size"
+           value="$(arg output_publisher_queue_size)" type="int"/>
+    <param name="center_pp/runtime/inference_queue_capacity"
+           value="$(arg inference_queue_capacity)" type="int"/>
+    <param name="center_pp/runtime/inference_budget_ms"
+           value="$(arg inference_budget_ms)" type="double"/>
+    <param name="center_pp/runtime/test_inject_delay_ms"
+           value="$(arg test_inject_delay_ms)" type="int"/>
+    <param name="center_pp/runtime/test_inject_exception_seq"
+           value="$(arg test_inject_exception_seq)" type="int"/>
+    <param name="center_pp/runtime/test_force_odom_unavailable"
+           value="$(arg test_force_odom_unavailable)" type="bool"/>
+    <param name="center_pp/runtime/test_force_empty_detections"
+           value="$(arg test_force_empty_detections)" type="bool"/>
+    <param name="center_pp/dynamic_removal/min_observations"
+           value="$(arg motion_min_observations)" type="int"/>
+    <param name="center_pp/dynamic_removal/min_duration_sec"
+           value="$(arg motion_min_duration_sec)" type="double"/>
+    <param name="center_pp/dynamic_removal/static_speed_max_mps"
+           value="$(arg static_speed_max_mps)" type="double"/>
+    <param name="center_pp/dynamic_removal/moving_speed_min_mps"
+           value="$(arg moving_speed_min_mps)" type="double"/>
+    <param name="center_pp/dynamic_removal/ground_search_margin_m"
+           value="$(arg ground_search_margin_m)" type="double"/>
+    <param name="center_pp/dynamic_removal/ground_min_inliers"
+           value="$(arg ground_min_inliers)" type="int"/>
+
+    <remap from="~pointcloud" to="$(arg pointcloud_topic)"/>
+    <remap from="~odom" to="$(arg odom_topic)"/>
+    <!-- static_points remains the byte-identical safety baseline. -->
+    <remap from="~pointcloud_static" to="/dynamic_removal/static_points"/>
+    <remap from="~pointcloud_raw" to="/dynamic_removal/raw_points"/>
+    <remap from="~box" to="/dynamic_removal/boxes"/>
+    <remap from="~dynamic_box" to="/dynamic_removal/moving_boxes"/>
+    <remap from="~pointcloud_cluster" to="/dynamic_removal/moving_object_points"/>
+    <remap from="~filtered_points" to="/dynamic_removal/filtered_points"/>
+    <remap from="~static_candidate_points" to="/dynamic_removal/static_candidate_points"/>
+    <remap from="~protected_ground_points" to="/dynamic_removal/protected_ground_points"/>
+    <remap from="~ground_diagnostics" to="/dynamic_removal/ground_diagnostics"/>
+    <remap from="~frame_diagnostics" to="/dynamic_removal/frame_diagnostics"/>
+    <remap from="~centerpoint_vel" to="/dynamic_removal/velocity_markers"/>
+    <remap from="~center_markers" to="/dynamic_removal/center_markers"/>
+  </node>
+</launch>

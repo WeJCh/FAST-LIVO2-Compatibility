@@ -68,13 +68,7 @@ class LoopBackend
 public:
   explicit LoopBackend(const LoopBackendConfig &config);
 
-  static bool loadConfigFile(const std::string &path, LoopBackendConfig *config,
-                             std::string *error = nullptr);
-  bool loadKeyframes(const std::string &keyframe_dir, std::string *error = nullptr);
-  bool optimize(std::string *error = nullptr);
-  bool exportResults(const std::string &output_dir, std::string *error = nullptr) const;
-
-  // 阶段 B 在线接口。前端只调用 enqueueOnlineKeyframe()，后台线程调用 runOnce()。
+  // 在线接口：前端只调用 enqueueOnlineKeyframe()，后台线程调用 runOnce()。
   // 该函数会深拷贝点云，确保前端复用 feats_down_body 时不会影响后台。
   void setImuLidarExtrinsic(const Eigen::Isometry3d &T_imu_lidar);
   bool enqueueOnlineKeyframe(int id, double timestamp,
@@ -84,14 +78,12 @@ public:
   std::size_t pendingOnlineKeyframeCount() const;
   bool runOnce(std::string *error = nullptr);
   bool getLatestResult(LoopBackendResult *result) const;
-  // 将最近一次在线快照按阶段 A 的同一格式导出，便于自动交付与离线重跑对比。
+  // 导出最近一次完成优化的在线快照。
   bool exportLatestOnlineResult(const std::string &output_dir, std::string *error = nullptr) const;
 
-  const std::vector<LoopEdgeReport> &loopEdges() const { return loop_edges_; }
-
 private:
-  bool loadImuLidarExtrinsic(const std::string &metadata_path, Eigen::Isometry3d *T_imu_lidar,
-                              std::string *error) const;
+  bool optimize(std::string *error = nullptr);
+  bool writeResults(const std::string &output_dir, std::string *error = nullptr) const;
   pcl::PointCloud<PointType>::Ptr makeHistorySubmap(std::size_t center_index) const;
   pcl::PointCloud<PointType>::Ptr buildOptimizedMap() const;
 

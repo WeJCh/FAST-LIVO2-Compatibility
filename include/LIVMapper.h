@@ -79,7 +79,7 @@ public:
   void enqueueDenseRgbCache(const PointCloudXYZRGB::Ptr &cloud, double timestamp);
   void denseRgbCacheWriterThread();
   void exportDenseRgbMapOnShutdown();
-  void cleanupC2IntermediateFiles();
+  void cleanupLoopIntermediateFiles();
   void readParameters(ros::NodeHandle &nh);
 #ifdef FAST_LIVO_HAS_LOOP_BACKEND
   void initializeOnlineLoopBackend();
@@ -113,6 +113,9 @@ public:
   double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0, last_timestamp_img = -1.0;
   double filter_size_surf_min = 0;
   double filter_size_pcd = 0;
+  // The default remains Log/pcd.  Phase-4 controlled runs override this to
+  // separate raw and filtered maps, so neither run can overwrite the other.
+  string pcd_output_dir;
   double _first_lidar_time = 0.0;
   double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 
@@ -127,8 +130,8 @@ public:
   M3D last_keyframe_rot = M3D::Identity();
   string keyframe_dir, keyframe_output_dir;
 
-  // 阶段 C1：记录与 all_raw_points.pcd 相同的彩色世界系点云批次。
-  // 每个批次带时间戳，离线工具据此插值最终回环校正场，不改动在线前端状态。
+  // 记录与 all_raw_points.pcd 相同的彩色世界系点云批次。
+  // 每个批次带时间戳，用于插值最终回环校正场，不改动在线前端状态。
   struct DenseRgbCacheItem
   {
     uint64_t id = 0;
@@ -138,7 +141,7 @@ public:
   bool dense_rgb_cache_enabled = true;
   int dense_rgb_cache_queue_size = 8;
   string dense_rgb_cache_dir = "Log/dense_rgb_cache";
-  // 阶段 C2：B.5 成功后自动输出完全不降采样的最终照片级地图。
+  // 收到正常退出信号后，自动输出完全不降采样的最终照片级地图。
   bool dense_rgb_auto_export_on_shutdown = false;
   double dense_rgb_auto_export_voxel_leaf_m = 0.0;
   bool dense_rgb_cleanup_intermediate_on_success = false;
@@ -153,7 +156,7 @@ public:
   uint64_t dense_rgb_cache_next_id = 0;
 
 #ifdef FAST_LIVO_HAS_LOOP_BACKEND
-  // 阶段 B：前端只提交关键帧快照，后台优化结果只用于 map 坐标系发布。
+  // 前端只提交关键帧快照，后台优化结果只用于 map 坐标系发布。
   // 不得以此覆盖 _state 或 voxelmap_manager，保证 odom 前端连续。
   bool online_loop_enable = false;
   double online_loop_frequency_hz = 0.2;
