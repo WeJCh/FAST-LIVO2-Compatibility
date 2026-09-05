@@ -78,20 +78,20 @@ sudo make install
 Vikit 提供本工程所需的相机模型、数学和插值功能，且应作为 catkin 包放在工作空间 `src` 下：
 
 ```bash
-cd "$WORKSPACE/src"
+cd ~/catkin_ws/src
 git clone https://github.com/xuankuzcr/rpg_vikit.git
 ```
 
-其中 `$WORKSPACE` 是 catkin 工作空间根目录。该仓库使用的 Vikit 与部分旧版 FAST-LIVO 工程不同，混用其他 Vikit 分支可能出现编译接口不兼容。
+本文所有命令固定以 `~/catkin_ws` 作为 catkin 工作空间根目录，这与当前机器狗工程的实际目录一致。若你的工作空间确实不在该位置，需要将文中所有 `~/catkin_ws` 整体替换为你的实际路径；不要只替换其中一条命令。该仓库使用的 Vikit 与部分旧版 FAST-LIVO 工程不同，混用其他 Vikit 分支可能出现编译接口不兼容。
 
 ### 4.5 获取源码并编译
 
-将本仓库放在 `$WORKSPACE/src/FAST-LIVO2`。首次克隆时，将下面的占位地址替换为你发布到 GitHub 的建图仓库地址：
+将本仓库放在 `~/catkin_ws/src/FAST-LIVO2`。首次克隆时使用：
 
 ```bash
-cd "$WORKSPACE/src"
+cd ~/catkin_ws/src
 git clone https://github.com/WeJCh/FAST-LIVO2-Compatibility FAST-LIVO2
-cd "$WORKSPACE"
+cd ~/catkin_ws
 source /opt/ros/noetic/setup.bash
 catkin_make -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_LOOP_BACKEND=ON -j4
 source devel/setup.bash
@@ -107,7 +107,7 @@ source devel/setup.bash
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$WORKSPACE/devel/setup.bash"
+source ~/catkin_ws/devel/setup.bash
 roslaunch fast_livo mapping_robotdog.launch rviz:=false
 ```
 
@@ -115,8 +115,8 @@ roslaunch fast_livo mapping_robotdog.launch rviz:=false
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$WORKSPACE/devel/setup.bash"
-python3 "$WORKSPACE/src/FAST-LIVO2/scripts/play_ros2_robotdog_to_ros1.py" \
+source ~/catkin_ws/devel/setup.bash
+python3 ~/catkin_ws/src/FAST-LIVO2/scripts/play_ros2_robotdog_to_ros1.py \
   "$DATASET_DIR" --rate 1.0 --wait-subscribers
 ```
 
@@ -126,12 +126,12 @@ python3 "$WORKSPACE/src/FAST-LIVO2/scripts/play_ros2_robotdog_to_ros1.py" \
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$WORKSPACE/devel/setup.bash"
+source ~/catkin_ws/devel/setup.bash
 roslaunch fast_livo mapping_robotdog_nav_map.launch \
   run_dir:="$MAP_DIR" rviz:=false
 ```
 
-其中 `$MAP_DIR` 例如为 `$WORKSPACE/src/FAST-LIVO2/Log/nav_runs/<map_id>`。不要把不同采集批次写入同一运行目录，否则关键帧、位姿和缓存文件会混在一起，无法可靠复现。
+其中 `$MAP_DIR` 例如为 `~/catkin_ws/src/FAST-LIVO2/Log/nav_runs/<map_id>`。不要把不同采集批次写入同一运行目录，否则关键帧、位姿和缓存文件会混在一起，无法可靠复现。
 
 ## 6. 建图输出与定位交接
 
