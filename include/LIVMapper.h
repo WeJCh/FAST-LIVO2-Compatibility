@@ -76,10 +76,13 @@ public:
   void initializeDenseRgbCache();
   void startDenseRgbCacheWriter();
   void stopDenseRgbCacheWriter();
-  void enqueueDenseRgbCache(const PointCloudXYZRGB::Ptr &cloud, double timestamp);
+  void enqueueDenseRgbCache(const PointCloudXYZRGB::Ptr &cloud, double timestamp,
+                            const StatesGroup &odom_imu_state);
   void denseRgbCacheWriterThread();
   void exportDenseRgbMapOnShutdown();
   void cleanupLoopIntermediateFiles();
+  void initializeSceneEvidenceExport();
+  void writeSceneEvidenceMetadata() const;
   void readParameters(ros::NodeHandle &nh);
 #ifdef FAST_LIVO_HAS_LOOP_BACKEND
   void initializeOnlineLoopBackend();
@@ -137,6 +140,11 @@ public:
     uint64_t id = 0;
     double timestamp = 0.0;
     PointCloudXYZRGB::Ptr cloud;
+    // The cache cloud is written in the front-end camera_init (odom) frame.
+    // Retaining the pose that produced it makes the raw observation
+    // reconstructible after loop closure instead of reducing it to xyzrgb.
+    double odom_imu_tx = 0.0, odom_imu_ty = 0.0, odom_imu_tz = 0.0;
+    double odom_imu_qx = 0.0, odom_imu_qy = 0.0, odom_imu_qz = 0.0, odom_imu_qw = 1.0;
   };
   bool dense_rgb_cache_enabled = true;
   int dense_rgb_cache_queue_size = 8;
@@ -154,6 +162,13 @@ public:
   std::atomic<bool> dense_rgb_cache_stop{true};
   std::thread dense_rgb_cache_writer_thread;
   uint64_t dense_rgb_cache_next_id = 0;
+
+  // Optional sidecar for product-map v4.  It deliberately records only
+  // provenance for the already-written RGB cache batches; it neither changes
+  // the LIO/VIO state nor duplicates the cache point clouds.
+  bool scene_evidence_export_enabled = false;
+  bool scene_evidence_export_overwrite = false;
+  string scene_evidence_output_dir;
 
 #ifdef FAST_LIVO_HAS_LOOP_BACKEND
   // 前端只提交关键帧快照，后台优化结果只用于 map 坐标系发布。

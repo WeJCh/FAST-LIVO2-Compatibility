@@ -4,3 +4,6 @@ RobotDogDataset/
 FAST-LIVOSAM/
 docs/
 report/
+scripts/__pycache__
+scene_pipeline/__pycache__
+FAST-LOCALIZATION/

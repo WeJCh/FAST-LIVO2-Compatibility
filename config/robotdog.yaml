@@ -142,6 +142,14 @@ dense_global_map:
   # 仅在最终稠密 RGB PCD 成功后删除缓存、关键帧、稀疏中间地图和原始轨迹文本。
   cleanup_intermediate_on_success: false
 
+# Product-map v4 observation sidecar.  It is disabled for ordinary mapping and
+# only records provenance for the existing dense RGB cache when explicitly
+# enabled by the dedicated scene-evidence launch file.
+scene_evidence_export:
+  enabled: false
+  output_dir: "Log/scene_evidence"
+  overwrite: false
+
 pcd_save:
   # 导出建图结果给远程查看时开启；正常退出后保存 Log/pcd 下的 PCD 地图和轨迹。
   pcd_save_en: true

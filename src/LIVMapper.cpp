@@ -15,6 +15,7 @@ which is included as part of this source code package.
 #include <cerrno>
 #include <cstring>
 #include <dirent.h>
+#include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -152,6 +153,7 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   initializeComponents();
   initializeKeyframeOutput();
   initializeDenseRgbCache();
+  initializeSceneEvidenceExport();
 #ifdef FAST_LIVO_HAS_LOOP_BACKEND
   initializeOnlineLoopBackend();
 #endif
@@ -238,6 +240,10 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<string>("dense_global_map/output_path", dense_rgb_output_path, "");
   nh.param<bool>("dense_global_map/cleanup_intermediate_on_success",
                  dense_rgb_cleanup_intermediate_on_success, false);
+  nh.param<bool>("scene_evidence_export/enabled", scene_evidence_export_enabled, false);
+  nh.param<string>("scene_evidence_export/output_dir", scene_evidence_output_dir,
+                   "Log/scene_evidence");
+  nh.param<bool>("scene_evidence_export/overwrite", scene_evidence_export_overwrite, false);
 #ifdef FAST_LIVO_HAS_LOOP_BACKEND
   nh.param<bool>("loop_backend/online_enable", online_loop_enable, false);
   nh.param<double>("loop_backend/online_frequency_hz", online_loop_frequency_hz, 0.2);
@@ -416,6 +422,88 @@ void LIVMapper::initializeDenseRgbCache()
   }
 }
 
+void LIVMapper::initializeSceneEvidenceExport()
+{
+  if (!scene_evidence_export_enabled) return;
+
+  // The sidecar only indexes dense RGB batches.  Do not silently create a
+  // metadata-only directory when the data it describes will not exist.
+  if (!dense_rgb_cache_enabled || !img_en)
+  {
+    ROS_ERROR("[scene-evidence] Export requires dense_global_map/enabled and common/img_en=true; disabling it.");
+    scene_evidence_export_enabled = false;
+    return;
+  }
+
+  if (scene_evidence_output_dir.empty()) scene_evidence_output_dir = "Log/scene_evidence";
+  if (scene_evidence_output_dir.front() != '/')
+  {
+    scene_evidence_output_dir = std::string(ROOT_DIR) + scene_evidence_output_dir;
+  }
+  const std::string manifest_path = scene_evidence_output_dir + "/frame_observations.csv";
+  if (!scene_evidence_export_overwrite && std::ifstream(manifest_path).good())
+  {
+    ROS_ERROR("[scene-evidence] Existing manifest found: %s. Choose a new scene_evidence_export/output_dir or set overwrite=true.",
+              manifest_path.c_str());
+    scene_evidence_export_enabled = false;
+    return;
+  }
+
+  if (!createDirectoryRecursively(scene_evidence_output_dir))
+  {
+    ROS_ERROR("[scene-evidence] Cannot create output directory: %s", scene_evidence_output_dir.c_str());
+    scene_evidence_export_enabled = false;
+    return;
+  }
+
+  // The manifest references the per-frame cache PCD files.  Removing them
+  // after export would leave a seemingly valid but unusable evidence result.
+  if (dense_rgb_cleanup_intermediate_on_success)
+  {
+    ROS_WARN("[scene-evidence] Disabling dense_global_map cleanup so frame-level source clouds remain available.");
+    dense_rgb_cleanup_intermediate_on_success = false;
+  }
+}
+
+void LIVMapper::writeSceneEvidenceMetadata() const
+{
+  if (!scene_evidence_export_enabled) return;
+  if (!createDirectoryRecursively(scene_evidence_output_dir)) return;
+
+  std::ofstream metadata(scene_evidence_output_dir + "/metadata.yaml", std::ios::out | std::ios::trunc);
+  if (!metadata.is_open())
+  {
+    ROS_ERROR("[scene-evidence] Cannot create metadata in: %s", scene_evidence_output_dir.c_str());
+    return;
+  }
+  metadata << "schema: 'fast_livo_scene_evidence/v1'\n"
+           << "purpose: 'Frame-level provenance for post-loop road and visible-scene extraction; not a semantic label map.'\n"
+           << "cloud_frame: 'camera_init'\n"
+           << "pose_frame: 'camera_init_to_imu'\n"
+           << "map_correction: 'Apply T_map_odom(t) interpolated from raw and optimized loop keyframe poses.'\n"
+           << "path_base: 'All paths in this metadata and frame_observations.csv are relative to this directory unless explicitly stated otherwise.'\n"
+           << "rgb_cache_dir: '../dense_rgb_cache'\n"
+           << "rgb_cache_manifest: '../dense_rgb_cache/manifest.csv'\n"
+           << "observation_manifest: 'frame_observations.csv'\n"
+           << "lidar_topic: '" << lid_topic << "'\n"
+           << "image_topic: '" << img_topic << "'\n"
+           << "image_compressed: " << (img_compressed ? "true" : "false") << "\n"
+           << "T_imu_lidar_translation: [" << extT[0] << ", " << extT[1] << ", " << extT[2] << "]\n"
+           << "T_imu_lidar_rotation_row_major: [" << extR(0, 0) << ", " << extR(0, 1) << ", " << extR(0, 2) << ", "
+           << extR(1, 0) << ", " << extR(1, 1) << ", " << extR(1, 2) << ", "
+           << extR(2, 0) << ", " << extR(2, 1) << ", " << extR(2, 2) << "]\n"
+           << "T_camera_lidar_translation: [" << cameraextrinT[0] << ", " << cameraextrinT[1] << ", " << cameraextrinT[2] << "]\n"
+           << "T_camera_lidar_rotation_row_major: [";
+  for (size_t i = 0; i < cameraextrinR.size(); ++i)
+  {
+    if (i) metadata << ", ";
+    metadata << cameraextrinR[i];
+  }
+  metadata << "]\n"
+           << "time_policy: 'timestamp is the VIO image header time used for the RGB batch; raw bag image lookup is by this timestamp.'\n"
+           << "known_limit: 'Forward road capture does not observe all building sides. Absence in this evidence means unobserved unless ray visibility proves free space.'\n";
+}
+
 void LIVMapper::startDenseRgbCacheWriter()
 {
   if (!dense_rgb_cache_enabled || dense_rgb_cache_writer_thread.joinable()) return;
@@ -447,7 +535,12 @@ void LIVMapper::startDenseRgbCacheWriter()
     dense_rgb_cache_stop.store(false);
   }
   dense_rgb_cache_writer_thread = std::thread(&LIVMapper::denseRgbCacheWriterThread, this);
+  writeSceneEvidenceMetadata();
   ROS_INFO("[dense-rgb] Recording frame-addressable RGB batches in: %s", dense_rgb_cache_dir.c_str());
+  if (scene_evidence_export_enabled)
+  {
+    ROS_INFO("[scene-evidence] Recording frame provenance in: %s", scene_evidence_output_dir.c_str());
+  }
 }
 
 void LIVMapper::stopDenseRgbCacheWriter()
@@ -461,7 +554,8 @@ void LIVMapper::stopDenseRgbCacheWriter()
   dense_rgb_cache_writer_thread.join();
 }
 
-void LIVMapper::enqueueDenseRgbCache(const PointCloudXYZRGB::Ptr &cloud, double timestamp)
+void LIVMapper::enqueueDenseRgbCache(const PointCloudXYZRGB::Ptr &cloud, double timestamp,
+                                     const StatesGroup &odom_imu_state)
 {
   if (!dense_rgb_cache_enabled || !cloud || cloud->empty() || !dense_rgb_cache_writer_thread.joinable()) return;
 
@@ -478,6 +572,14 @@ void LIVMapper::enqueueDenseRgbCache(const PointCloudXYZRGB::Ptr &cloud, double 
   item.id = dense_rgb_cache_next_id++;
   item.timestamp = timestamp;
   item.cloud = cloud;
+  item.odom_imu_tx = odom_imu_state.pos_end.x();
+  item.odom_imu_ty = odom_imu_state.pos_end.y();
+  item.odom_imu_tz = odom_imu_state.pos_end.z();
+  const Eigen::Quaterniond q(odom_imu_state.rot_end);
+  item.odom_imu_qx = q.x();
+  item.odom_imu_qy = q.y();
+  item.odom_imu_qz = q.z();
+  item.odom_imu_qw = q.w();
   dense_rgb_cache_queue.push_back(item);
   lock.unlock();
   dense_rgb_cache_cv.notify_all();
@@ -494,6 +596,24 @@ void LIVMapper::denseRgbCacheWriterThread()
     dense_rgb_cache_stop.store(true);
     dense_rgb_cache_cv.notify_all();
     return;
+  }
+  // This flag is configured before the writer starts.  Keep it local to the
+  // writer so a manifest I/O failure cannot race with the mapping thread.
+  const bool write_scene_evidence = scene_evidence_export_enabled;
+  std::ofstream observations;
+  if (write_scene_evidence)
+  {
+    observations.open(scene_evidence_output_dir + "/frame_observations.csv", std::ios::out | std::ios::trunc);
+    if (!observations.is_open())
+    {
+      ROS_ERROR("[scene-evidence] Cannot create observation manifest in: %s", scene_evidence_output_dir.c_str());
+    }
+    else
+    {
+      observations << "frame_id,vio_timestamp,point_count,odom_imu_tx,odom_imu_ty,odom_imu_tz,"
+                   << "odom_imu_qx,odom_imu_qy,odom_imu_qz,odom_imu_qw,rgb_cache_pcd,"
+                   << "source_image_topic,source_lidar_topic\n";
+    }
   }
 
   pcl::PCDWriter writer;
@@ -517,6 +637,8 @@ void LIVMapper::denseRgbCacheWriterThread()
 
     std::ostringstream filename;
     filename << frames_dir << "/frame_" << std::setfill('0') << std::setw(6) << item.id << ".pcd";
+    std::ostringstream evidence_filename;
+    evidence_filename << "../dense_rgb_cache/frames/frame_" << std::setfill('0') << std::setw(6) << item.id << ".pcd";
     if (writer.writeBinary(filename.str(), *item.cloud) != 0)
     {
       ROS_ERROR("[dense-rgb] Failed to write RGB cache batch: %s", filename.str().c_str());
@@ -525,6 +647,14 @@ void LIVMapper::denseRgbCacheWriterThread()
     manifest << item.id << ',' << std::setprecision(17) << item.timestamp << ','
              << item.cloud->size() << ',' << filename.str() << '\n';
     manifest.flush();
+    if (write_scene_evidence && observations.is_open())
+    {
+      observations << item.id << ',' << std::setprecision(17) << item.timestamp << ',' << item.cloud->size() << ','
+                   << item.odom_imu_tx << ',' << item.odom_imu_ty << ',' << item.odom_imu_tz << ','
+                   << item.odom_imu_qx << ',' << item.odom_imu_qy << ',' << item.odom_imu_qz << ',' << item.odom_imu_qw << ','
+                   << evidence_filename.str() << ',' << img_topic << ',' << lid_topic << '\n';
+      observations.flush();
+    }
   }
 }
 
@@ -2003,7 +2133,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   // 坐标系，最终导出时再应用按时间插值的 map<-odom 校正。
   if (dense_rgb_cache_enabled && LidarMeasures.lio_vio_flg == VIO && !laserCloudWorldRGB->empty())
   {
-    enqueueDenseRgbCache(laserCloudWorldRGB, LidarMeasures.measures.back().vio_time);
+    enqueueDenseRgbCache(laserCloudWorldRGB, LidarMeasures.measures.back().vio_time, _state);
   }
 
   /*** Publish Frame ***/
